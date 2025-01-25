@@ -146,6 +146,7 @@ def check_integrity():
 	у всех из cur_dirs (кроме root_dir) есть обаз из cur_stat и наоборот
 	для всех из hist есть образ в cur_stat или deleted
 	для всех из cur_stat у кого owner is not None есть owner в owners
+	cur_dirs.type  cur_stat.type = simple_type(cur_stat.st_mode)
 	'''
 
 	# присутствуют таблицы: cur_dirs, cur_stat, deleted, hist, owners
@@ -195,6 +196,11 @@ def check_integrity():
 	owners = {x[0] for x in CUR.execute('SELECT id FROM owners').fetchall()}
 	assert stat_owners <= owners, f'lost owner: {stat_owners - owners}'
 
+	# cur_dirs.type  cur_stat.type = simple_type(cur_stat.st_mode)
+	for (t1, t2, mode) in CUR.execute('SELECT cur_dirs.type, cur_stat.type, cur_stat.st_mode FROM cur_dirs JOIN cur_stat ON cur_dirs.id=cur_stat.id').fetchall():
+		assert t1==t2 , (t1,t2)
+		if mode is not None:
+			assert t2==simple_type(mode), (t2,simple_type(mode))
 # --------------
 # общие функции образа ФС
 # --------------
@@ -210,6 +216,8 @@ MDIR = 1
 MLINK = 2
 MOTHER = 3 # встречаются всякие сокеты, именованные каналы. Не смотря на то, что в /sys, /dev, /proc, /run - не лезем
 
+def os_stat(path,follow_symlinks=False):
+	return os.stat(path,follow_symlinks=follow_symlinks)
 def typ2str(x):
 	assert 0<=x<=3
 	return '-' if x==MFILE else \
@@ -321,17 +329,30 @@ def create_root(path,cursor):
 	fid = 0 if len(ids)==1 else ids[-2]
 
 	# рассчитываем, что src_path - обсолютный путь, не симлинк, не содержит // типа '/a//b/c'
+	path0 = path
 	path = path.split('/')
 
 	#print(ids,fid,path)
 	for name in path[len(ids):-1]:
 		cursor.execute('INSERT INTO cur_dirs (parent_id, name, modified, type) VALUES (?, ?, 2, ?)',(fid, name, MDIR))
 		(fid,) = cursor.execute('SELECT id FROM cur_dirs WHERE parent_id =? AND name=?',(fid,name)).fetchone()
-	cursor.execute('INSERT INTO cur_dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)',(fid, path[-1], MDIR))
-	(fid,) = cursor.execute('SELECT id FROM cur_dirs WHERE parent_id =? AND name=?',(fid,path[-1])).fetchone()
+	try:
+		stat = os_stat(path0)
+	except Exception as e:
+		print(path,type(e),e)
+		if name in dirs:
+			CUR.executemany('INSERT INTO cur_dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (fid, path[-1], MDIR))
+			(fid,) = CUR.execute('SELECT id FROM cur_dirs WHERE parent_id = ? AND name = ?',(fid, path[-1])).fetchone()
+			CUR.execute('INSERT INTO cur_stat (id,type) VALUES (?,?)', (fid,MDIR))
+			print('blindly create dir')
+	else:
+		CUR.execute('INSERT INTO cur_dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (fid, path[-1], simple_type(stat.st_mode)))
+		(fid,) = CUR.execute('SELECT id FROM cur_dirs WHERE parent_id = ? AND name = ?',(fid, path[-1])).fetchone()
+		CUR.execute('INSERT INTO cur_stat (id,type) VALUES (?,?)', (fid,simple_type(stat.st_mode)))
+		update_stat(fid,stat,CUR)
 	return fid
 
-def init_cur_dirs(root_dirs):
+def init_cur(root_dirs):
 	'''
 	обходит ФС из root_dirs и заполняет таблицу cur_dirs
 	'''
@@ -345,36 +366,21 @@ def init_cur_dirs(root_dirs):
 				assert pathids[-1] is not None
 				#print(root,pathids,dirs)
 				# при выполнении stat MFILE/MDIR может быть заменён на MLINK или MOTHER
-				CUR.executemany('INSERT INTO cur_dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', [(pathids[-1], x, MDIR) for x in dirs])
-				CUR.executemany('INSERT INTO cur_dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', [(pathids[-1], x, MFILE) for x in files])
-
-def init_stat():
-	'''
-	делает stat для всех объектов и заполняет cur_stat
-	'''
-	with CON:
-		ids = CUR.execute('SELECT id FROM cur_dirs WHERE modified !=2').fetchall()
-		cnt = 0
-		print('stat files:')
-		for (fid,) in tqdm(ids):
-			path = None
-			try:
-				path = id2path(fid,CUR)
-				stat = os.stat(path,follow_symlinks=False)
-				if not is_link(stat.st_mode) and not is_dir(stat.st_mode) and not is_file(stat.st_mode) and not is_other(stat.st_mode):
-					raise Exception('unknown type')
-
-				CUR.execute('UPDATE cur_dirs SET type = ? WHERE id = ?',(simple_type(stat.st_mode),fid))
-				CUR.execute('INSERT INTO cur_stat (id,type) VALUES (?,?)', (fid,simple_type(stat.st_mode)))
-				update_stat(fid,stat,CUR)
-				cnt += 1
-				if cnt%1000000==0:
-					CUR.execute('COMMIT')
-			except FileNotFoundError as e:
-				if VERBOSE>=2: print(e)
-				set_modified(fid, CUR)
-			except Exception as e:
-				print(fid,path,type(e),e)
+				for name in dirs+files:
+					try:
+						stat = os_stat(root+'/'+name)
+					except Exception as e:
+						print(root+'/'+name,type(e),e)
+						if name in dirs:
+							CUR.executemany('INSERT INTO cur_dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (pathids[-1], name, MDIR))
+							(fid,) = CUR.execute('SELECT id FROM cur_dirs WHERE parent_id = ? AND name = ?',(pathids[-1], name)).fetchone()
+							CUR.execute('INSERT INTO cur_stat (id,type) VALUES (?,?)', (fid,MDIR))
+							print('blindly create dir')
+					else:
+						CUR.execute('INSERT INTO cur_dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (pathids[-1], name, simple_type(stat.st_mode)))
+						(fid,) = CUR.execute('SELECT id FROM cur_dirs WHERE parent_id = ? AND name = ?',(pathids[-1], name)).fetchone()
+						CUR.execute('INSERT INTO cur_stat (id,type) VALUES (?,?)', (fid,simple_type(stat.st_mode)))
+						update_stat(fid,stat,CUR)
 
 def update_hashes(with_all=True, modify=None):
 	# todo calc only unknown hashes
@@ -394,9 +400,9 @@ def update_hashes(with_all=True, modify=None):
 					path = id2path(fid,cursor)
 					hsh = hashlib.md5(open(path,'rb').read()).hexdigest()
 					if modify is not None:
-						(ohash) = cursor.execute('SELECT data FROM cur_stat WHERE id = ?',(fid,)).fetchone()
+						(ohash,) = cursor.execute('SELECT data FROM cur_stat WHERE id = ?',(fid,)).fetchone()
 						if ohash is not None and ohash!=hsh:
-							modify(fid, os.stat(path), True, cursor)
+							modify(fid, os_stat(path), True, cursor)
 					cursor.execute('UPDATE cur_stat SET data = ? WHERE id = ?',(hsh,fid))
 					cursor.execute('UPDATE cur_dirs SET modified = 0 WHERE id = ?',(fid,))
 					cnt+=1
@@ -415,14 +421,18 @@ def update_hashes(with_all=True, modify=None):
 				hsh = 0
 				for name,fid,ftype,modified in n:
 					if ftype==MFILE:
-						(lhsh,) = cursor.execute('SELECT data FROM cur_stat WHERE id = ?',(fid,)).fetchone()
+						try:
+							(lhsh,) = cursor.execute('SELECT data FROM cur_stat WHERE id = ?',(fid,)).fetchone()
+						except Exception as e:
+							print(fid)
+							raise e
 					elif ftype==MLINK:
 						try:
 							lnk = os.readlink(id2path(fid,cursor))
 							if modify is not None:
 								(olink,) = cursor.execute('SELECT data FROM cur_stat WHERE id = ?',(fid,)).fetchone()
 								if olink is not None and olink!=lnk:
-									modify(fid, os.stat(id2path(fid)), True, cursor)
+									modify(fid, os_stat(id2path(fid)), True, cursor)
 							lhsh = hashlib.md5(lnk.encode()).hexdigest()
 							cursor.execute('UPDATE cur_stat SET data = ? WHERE id = ?',(lnk,fid))
 						except FileNotFoundError:
@@ -456,8 +466,7 @@ def init_db(nohash):
 	создаёт и инициализирует таблицы
 	'''
 	create_tables()
-	init_cur_dirs(ROOT_DIRS)
-	init_stat()
+	init_cur(ROOT_DIRS)
 	if not nohash:
 		update_hashes()
 
@@ -621,7 +630,7 @@ def modify(fid, stat, static_found, cursor):
 	'''
 	известно, что объект fid изменился, известен его новый stat
 	'''
-	if VERBOSE>=2: print('modify',fid, id2path(fid, cursor), static_found)#stat, 
+	if VERBOSE>=2: print('modify',fid, id2path(fid, cursor), static_found)#stat,
 
 	set_modified(fid, cursor)
 	update_stat(fid,stat,cursor)
@@ -649,7 +658,7 @@ def create(parent_id, name, stat, static_found, cursor, owner=None, save=None):
 	'''
 	if owner is None or save is None:
 		(owner,save) = owner_save(parent_id,cursor)
-	if VERBOSE>=2: print('create',parent_id, id2path(parent_id, cursor), name, static_found, owner, save)# stat, 
+	if VERBOSE>=2: print('create',parent_id, id2path(parent_id, cursor), name, static_found, owner, save)# stat,
 	set_modified(parent_id, cursor)
 	n = cursor.execute('SELECT id, owner FROM deleted WHERE parent_id =? AND name=?',(parent_id,name)).fetchone()
 	if n is None: # раньше НЕ удалялся
@@ -758,7 +767,7 @@ def walk_stat(with_all, did, path='', typ=MDIR, modified=0):
 					this_modified = True
 					cpath = path+'/'+name
 					try:
-						cstat = os.stat(cpath)
+						cstat = os_stat(cpath)
 					except FileNotFoundError:
 						print(cpath,"found new item but can't stat it")
 						continue
@@ -766,7 +775,7 @@ def walk_stat(with_all, did, path='', typ=MDIR, modified=0):
 					walk_stat(with_all, fid, cpath, simple_type(cstat.st_mode), 3)
 			if modified!=3:
 				try:
-					stat = os.stat(path)
+					stat = os_stat(path)
 					this_modified |= not stat_eq(stat,get_stat(did,CUR))
 					if this_modified:
 						modify(did, stat, True, CUR)
@@ -800,7 +809,7 @@ def create_parents(path,cursor,ids=None):
 	parent_path = '/'.join(path[:len(ids)])
 	for name in path[len(ids):-1]:
 		parent_path+= ('/'+name)
-		lstat = os.stat(parent_path, follow_symlinks=False) # FileNotFoundError будет пойман в области watchdog-а
+		lstat = os_stat(parent_path) # FileNotFoundError будет пойман в области watchdog-а
 		assert simple_type(lstat.st_mode)==MDIR, simple_type(lstat.st_mode)
 		fid = create(fid, name, lstat, True, cursor, owner, save)
 
@@ -878,8 +887,93 @@ def moved(src_path, dest_path, stat, is_directory, is_synthetic, cursor):
 	moved1(ids[-1],dest_path, cursor)
 
 # --------------------------------
-# мониторинговые и интерфейсные функции
+# интерфейсные функции
 # --------------------------------
+
+def update_owner(name,save, strict = False):
+	with CON:
+		if strict:
+			if CUR.execute('SELECT * FROM owners WHERE name = ?',(name,)).fetchone() is None:
+				raise Exception('such owner does not exist')
+		CUR.execute('''INSERT INTO owners (name, save) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET
+			name = excluded.name,    save = excluded.save ''', (name,save))
+
+def rename_owner(oname, name, stric = False):
+	with CON:
+		if strict:
+			if CUR.execute('SELECT * FROM owners WHERE name = ?',(name,)).fetchone() is None:
+				raise Exception('such owner does not exist')
+		CUR.execute('UPDATE owners SET name = ? WHERE name = ?',(name,oname))
+
+def delete_owner(owner, stric = False):
+	with CON:
+		if strict:
+			if CUR.execute('SELECT * FROM owners WHERE name = ?',(name,)).fetchone() is None:
+				raise Exception('such owner does not exist')
+		CUR.execute('DELETE FROM owners WHERE name = ?',(owner,))
+
+def set_owner(path, owner, *, save=None, update=False, in_deleted=False, del_hist=False):
+	'''
+	если такого owner-а еще нет - он создаётся
+	save - надо ли в будущем сохранять события изменений этих файлов
+		если None - не обновлять owner-а
+	update:
+		если True - устанавливает owner-а для всех вложенных объектов
+		если False - только для тех вложенных, у которых еще нет owner-а или он такой как у объекта path
+	in_deleted - устанавливать ли owner-а для удалённых объектов
+	del_hist - удалить ли все события с этими файлами
+	'''
+	path = os.path.abspath(path)
+	if save is not None and owner is not None:
+		update_owner(owner,save,True)
+	with CON:
+		with closing(CON.cursor()) as cursor:
+			# oid - owner-id, который будем устанавливать
+			if owner is not None:
+				(oid,) = cursor.execute('SELECT id FROM owners WHERE name = ?',(owner,)).fetchone()
+			else:
+				oid = None
+
+			def my_walk(did):
+				if del_hist:
+					cursor.execute('DELETE FROM hist WHERE id = ?',(did,))
+				if update:
+					n = cursor.execute('SELECT name,id,type FROM cur_dirs WHERE parent_id = ? ',(did,)).fetchall()
+				else:
+					n = cursor.execute('''SELECT name, cur_dirs.id, cur_dirs.type FROM cur_dirs JOIN cur_stat ON cur_dirs.id=cur_stat.id
+						WHERE cur_dirs.parent_id = ? AND cur_stat.owner ISNULL''',(did,)).fetchall()
+				for name,fid,ftype in n:
+					cursor.execute('UPDATE cur_stat SET owner = ? WHERE id = ?',(oid,fid))
+					my_walk(fid)
+				if in_deleted:
+					if update:
+						n = cursor.execute('SELECT name,id FROM deleted WHERE parent_id = ? ',(did,)).fetchall()
+					else:
+						n = cursor.execute('''SELECT name,id FROM deleted
+							WHERE parent_id = ? AND owner ISNULL''',(did,)).fetchall()
+					for name,fid in n:
+						cursor.execute('UPDATE deleted SET owner = ? WHERE id = ?',(oid,fid))
+						my_walk(fid)
+
+			fid = path2ids(path,cursor)[-1]
+			cursor.execute('UPDATE cur_stat SET owner = ? WHERE id = ?',(oid,fid))
+			(typ,) = cursor.execute('SELECT type FROM cur_dirs WHERE id = ?',(fid,)).fetchone()
+			if typ==MDIR:
+				my_walk(fid)
+			if del_hist:
+				cursor.execute('DELETE FROM hist WHERE id = ?',(fid,))
+			return fid
+
+def help_owner():
+	print('''
+		update(name,save, stric = False)
+		create(name,save, stric = False)
+		rename(oname, name, stric = False)
+		delete(owner, stric = False)
+		set(path, owner, *, save=None, update=False, in_deleted=False, del_hist=False)
+		hashes(with_all=True)
+		help()
+		''')
 
 def watch(do_stat = True):
 	'''запускает watchdog, который ловит события файловой системы
@@ -921,14 +1015,14 @@ def watch(do_stat = True):
 			pass
 		elif event.event_type=='modified' or event.event_type=='closed':
 			try:
-				stat = os.stat(event.src_path,follow_symlinks=False)
+				stat = os_stat(event.src_path)
 				modified(event.src_path, stat, event.is_directory, event.is_synthetic, CUR)
 			except FileNotFoundError as e:
 				print('error in modified event:', e, event.src_path, event.is_directory, event.is_synthetic)
 			
 		elif event.event_type=='created':
 			try:
-				stat = os.stat(event.src_path,follow_symlinks=False)
+				stat = os_stat(event.src_path)
 				created(event.src_path, stat, event.is_directory, event.is_synthetic, CUR)
 			except FileNotFoundError as e:
 				print('error in created event:', e, event.src_path, event.is_directory, event.is_synthetic)
@@ -936,7 +1030,7 @@ def watch(do_stat = True):
 			deleted(event.src_path, event.is_directory, event.is_synthetic, CUR)
 		elif event.event_type=='moved':
 			try:
-				stat = os.stat(event.dest_path,follow_symlinks=False)
+				stat = os_stat(event.dest_path)
 			except FileNotFoundError:
 				stat = make_dict(st_mode=None,st_ino=None,st_dev=None,st_nlink=None,st_uid=None,st_gid=None,st_size=None,
 					   st_atime=None,st_mtime=None,st_ctime=None,st_blocks=None,st_blksize=None)
@@ -992,15 +1086,39 @@ def watch(do_stat = True):
 				event_handler(event)
 			elif type(event) is str:
 				if event=='q':
+					if CON.in_transaction:
+						CUR.execute('COMMIT')
 					break
 				elif event=='u':
 					if CON.in_transaction:
 						CUR.execute('COMMIT')
 						print('COMMIT',datetime.fromtimestamp(time()))
 				else:
-					print(222,event)
+					import yaml
+					try:
+						event = yaml.safe_load('['+event+']')
+					except ParserError as e:
+						print(e)
+					else:
+						if len(event)==2: event.append({})
+						fun, args, kwargs = event
+						if CON.in_transaction:
+							CUR.execute('COMMIT')
+						try:
+							if fun=='update': update_owner(*args,**kwargs)
+							if fun=='create': update_owner(*args,**kwargs)
+							if fun=='delete': delete_owner(*args,**kwargs)
+							if fun=='rename': rename_owner(*args,**kwargs)
+							if fun=='set': set_owner(*args,**kwargs)
+							if fun=='hashes': update_hashes(*args,**kwargs, modify=modify)
+							if fun=='help': help_owner(*args,**kwargs)
+						except Exception as e:
+							print(e)
+						if CON.in_transaction:
+							CUR.execute('COMMIT')
+						print('-----------------------')
 			else:
-				print(type(event))
+				print('unknown type:',type(event))
 			q.task_done()
 		print(1,CON)
 	finally:
@@ -1008,6 +1126,218 @@ def watch(do_stat = True):
 		observer.join()  # Ждем завершения потока
 	print(2,CON)
 
+# --------------------------------
+# мониторинговые функции
+# --------------------------------
+
+import pwd
+def get_username_by_uid(uid):
+	try:
+		return pwd.getpwuid(uid).pw_name
+	except KeyError:
+		return None  # Если UID не существует
+import grp
+def get_groupname_by_gid(gid):
+	try:
+		return grp.getgrgid(gid).gr_name
+	except KeyError:
+		return None  # Если UID не существует
+def access_mode(st_mode):
+	mode = STAT.S_IMODE(st_mode)
+	assert mode < 2**9
+	s = ''
+	for i in range(6,-1,-3):
+		s+= 'r' if mode & 2**(i+2) else '-'
+		s+= 'w' if mode & 2**(i+1) else '-'
+		s+= 'x' if mode & 2**(i+0) else '-'
+	return s
+def print_fid(cursor, *,strict=True,short=True):
+	for parent_id,name,fid,typ,modified in cursor:
+		assert 0 <= modified <= 2
+		n = CUR.execute('SELECT * FROM cur_stat WHERE id = ?',(fid,)).fetchone()
+		if n is None:
+			if strict:
+				assert 1 <= modified <= 2
+			if typ==MFILE:   typ = '-'
+			elif typ==MDIR:  typ = 'd'
+			elif typ==MLINK: typ = 'l'
+			else:
+				typ = 'o'
+				assert typ==MOTHER
+			print(('R' if modified==2 else 'M' if modified==1 else '-')+' '+str(fid),typ,name,sep='\t')
+		else:
+			(fid1,typ1,
+			   st_mode,t_ino,st_dev,st_nlink,st_uid,st_gid,st_size,st_atime,st_mtime,st_ctime,st_blocks,st_blksize,
+				data,owner) = n
+			assert fid==fid1 and typ==typ1 and simple_type(st_mode)==typ, (fid,fid1,typ,typ1,simple_type(st_mode),typ)
+
+	# fid drwxr-xr-x 3 root root 1785 Jun 29 10:11 Videos hash/link owner
+
+	#    -. Обычный или исполняемый документ
+	#    d. Папка.
+	#    l. Символьная ссылка.
+	#    p. ФИФО.
+	#    b. Блочное устройство.
+	#    s. Сокет.
+	#    c. Символьное устройство.
+			typ = typ2str(typ)
+			if typ=='o':
+				if STAT.S_ISFIFO(st_mode):   typ = 'p'
+				elif STAT.S_ISBLK(st_mode):  typ = 'b'
+				elif STAT.S_ISSOCK(st_mode): typ = 's'
+				elif STAT.S_ISCHR(st_mode):  typ = 'c'
+				else:                     typ = '?'
+			if owner is not None:
+				(owner,) = CUR.execute('SELECT name FROM owners WHERE id = ?',(owner,)).fetchone()
+			if short:
+				print(('M' if modified==1 else '-')+' '+\
+					  str(fid),
+					  typ+access_mode(st_mode),
+					  datetime.fromtimestamp(st_mtime),
+					  name,
+					  '<='+owner if owner is not None else '',
+					 sep='\t')
+			else:
+				print(('M' if modified==1 else '-')+' '+\
+					  str(fid),
+					  typ+access_mode(st_mode),
+					  st_nlink,
+					  get_username_by_uid(st_uid),
+					  get_groupname_by_gid(st_gid),
+					  st_size,
+					  datetime.fromtimestamp(st_mtime),
+					  name,
+					  ('->' if typ=='l' else '')+str(data),
+					  '<='+owner if owner is not None else '',
+					 sep='\t')
+
+		if typ=='d':
+			yield fid
+
+def ls(fid=None,*,strict=True,short=True):
+	if fid is None:
+		fid = os.getcwd()
+	with CON:
+		if type(fid) is str:
+			if not fid.startswith('/'):
+				fid = os.getcwd()+'/'+fid
+			print(ids := path2ids(fid,CUR))
+			fid = ids[-1]
+		with closing(CON.execute('SELECT * FROM cur_dirs WHERE parent_id = ?',(fid,))) as cursor:
+			list(print_fid(cursor, strict=strict, short=short))
+def ls_r(fid=None,*,strict=True,short=True):
+	if fid is None:
+		fid = os.getcwd()
+	with CON:
+		if type(fid) is str:
+			if not fid.startswith('/'):
+				fid = os.getcwd()+'/'+fid
+			print(ids := path2ids(fid,CUR))
+			fid = ids[-1]
+		else:
+			print(id2path(fid,CUR),':')
+		with closing(print_fid(CON.execute('SELECT * FROM cur_dirs WHERE parent_id = ?',(fid,)), strict=strict)) as cursor:
+			for x in list(cursor):
+				ls_r(x,strict=strict, short=short)
+
+def list_modified():
+	with CON:
+		def my_walk(did,path):
+			n = CUR.execute('SELECT name,id,type,modified FROM cur_dirs WHERE parent_id = ? AND (modified = 1 OR modified = 2)',(did,)).fetchall()
+			for name,fid,ftype,modified in n:
+				if ftype==MDIR and modified !=0:
+					if modified==1:
+						print(path+'/'+name+'/')
+					my_walk(fid,path+'/'+name)
+				else:
+					print(path+'/'+name)
+		my_walk(0,'')
+
+def hist_byid(fid):
+	print(id2path_hist(fid,CUR))
+	with closing(CON.execute('SELECT * FROM cur_dirs WHERE id = ?',(fid,))) as cursor:
+		list(print_fid(cursor))
+	for (parent_id, name, fid, typ, etyp,
+		 st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid, st_size, st_atime, st_mtime, st_ctime, st_blocks, st_blksize,
+		data, owner, time, static_found) in \
+		CUR.execute('SELECT * FROM hist WHERE id = ? ORDER BY time DESC',(fid,)).fetchall():
+			if etyp==ECREAT: etyp = 'C'
+			elif etyp==EDEL: etyp = 'D'
+			elif etyp==EMOVE: etyp = 'V'
+			elif etyp==EMODIF:etyp= 'M'
+			else: assert False, etyp
+			if etyp=='V':
+				print(etyp+' '+('S' if static_found else 'W')+' '+str(datetime.fromtimestamp(time)),
+					 id2path_hist(parent_id,CUR)+'/'+name)
+			else:
+				print(etyp+' '+('S' if static_found else 'W')+' '+str(datetime.fromtimestamp(time)))
+
+def ls_hist(path=None, static_found=None):
+	'''
+	
+	'''
+	if path is None:
+		for dr in ROOT_DIRS:
+			ls_hist(dr, static_found)
+		return
+	path = os.path.abspath(path)
+	(fid,deleted) = path2ids_hist(path,CUR)
+	fid = fid[-1]
+	if fid is None:
+		raise Exception('path does not exist')
+	print('cnt\tid ?D\tpath')
+	print('--------------------')
+	def my_walk(did):
+		if static_found:
+			cnt = CON.execute('SELECT COUNT(*) AS count FROM hist WHERE id = ? AND static_found = 1 GROUP BY id ',(did,)).fetchone()
+		else:
+			cnt = CON.execute('SELECT COUNT(*) AS count FROM hist WHERE id = ? GROUP BY id ',(did,)).fetchone()
+		if cnt is not None and cnt[0]>0:
+			path, deleted = id2path_hist(did,CUR)
+			print(cnt[0],str(did)+(' D' if deleted else '  '),path, sep = '\t')
+		for (fid,) in CON.execute('SELECT id FROM cur_dirs WHERE parent_id = ?',(did,)).fetchall():
+			my_walk(fid)
+		for (fid,) in CON.execute('SELECT id FROM deleted WHERE parent_id = ?',(did,)).fetchall():
+			my_walk(fid)
+	my_walk(fid)
+
+def list_owners(path=None, show_deleted=False):
+	# выводить только если owner и owner родителя не совпадают
+	# deleted - с пометками
+	if path is None:
+		for dr in ROOT_DIRS:
+			list_owners(dr, show_deleted)
+		return
+	path = os.path.abspath(path)
+	# format: save owner fid deleted path
+	(fid,deleted) = path2ids_hist(path,CUR)
+	fid = fid[-1]
+	if fid is None:
+		raise Exception('path does not exist')
+	if deleted:
+		n = CUR.execute('SELECT owners.save, owners.name, owners.id FROM owners JOIN deleted ON owners.id=deleted.owner WHERE deleted.id = ?',(fid,)).fetchone()
+	else:
+		n = CUR.execute('SELECT owners.save, owners.name, owners.id FROM owners JOIN cur_stat ON owners.id=cur_stat.owner WHERE cur_stat.id = ?',(fid,)).fetchone()
+	if n is not None:
+		(save, oname, owner) = n
+	else:
+		(save, oname, owner) = (True, None, None)
+	if show_deleted or not deleted:
+		print(save,oname,str(fid)+(' D' if deleted else '  '), path, sep='\t')
+	def my_walk(did,deleted,downer):
+		if not deleted:
+			for (save, oname, owner, fid) in CUR.execute('''SELECT owners.save, owners.name, owners.id, cur_stat.id
+					FROM owners JOIN cur_stat ON owners.id=cur_stat.owner JOIN cur_dirs ON cur_dirs.id=cur_stat.id  WHERE cur_dirs.parent_id = ?''',(did,)).fetchall():
+				if owner!=downer:
+					print(save,oname,str(fid)+'  ', id2path(fid), sep='\t')
+				my_walk(fid,False,owner)
+		if show_deleted:
+			for (save, oname, owner, fid) in CUR.execute('''SELECT owners.save, owners.name, owners.id, deleted.id
+					FROM owners JOIN deleted ON owners.id=deleted.owner WHERE deleted.parent_id = ?''',(did,)).fetchall():
+				if owner!=downer:
+					print(save,oname,str(fid)+' D', id2path_hist(fid)[0], sep='\t')
+				my_walk(fid,True,owner)
+	my_walk(fid,deleted,owner)
 
 # ------------------------------------
 # инициализация приложения/библиотеки
@@ -1059,7 +1389,7 @@ def init_connction(files_db, root_dirs = None, nohash = False, ro = True):
 			raise Exception(f'database {files_db} does not exist. Create it with root_dirs argument')
 		FILES_DB = files_db
 		if ro:
-			CON = sqlite3.connect('files:'+FILES_DB+'?mode=ro')
+			CON = sqlite3.connect('files:'+FILES_DB+'?mode=ro', uri=True)
 		else:
 			CON = sqlite3.connect(FILES_DB)
 		CUR = CON.cursor()
@@ -1082,7 +1412,7 @@ def init_connction(files_db, root_dirs = None, nohash = False, ro = True):
 		check_integrity()
 		if ro:
 			CON.close()
-			CON = sqlite3.connect('files:'+FILES_DB+'?mode=ro')
+			CON = sqlite3.connect('files:'+FILES_DB+'?mode=ro', uri=True)
 
 if __name__ == "__main__":
 	import sys
