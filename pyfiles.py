@@ -815,12 +815,12 @@ def create_parents(path,cursor,ids=None):
 
 	return fid, path[-1], owner, save
 
-def created1(ids, src_path, stat, is_directory, cursor):
+def create1(ids, src_path, stat, is_directory, cursor):
 	if VERBOSE>=2: print('created1',ids, src_path, stat, is_directory, cursor)
 	(fid, name, owner, save) = create_parents(src_path,cursor,ids)
 	create(fid, name, stat, False, cursor, owner, save)
 
-def moved(fid, dest_path, cursor):
+def move(fid, dest_path, cursor):
 	'''
 	существующий объект fid перемещается на новое место
 	фактически у него изменяется только parent_id, name
@@ -845,7 +845,7 @@ def modified(src_path, stat, is_directory, is_synthetic, cursor):
 	ids = path2ids(src_path,cursor)
 	if ids[-1] is None:
 		print('do modified as created',src_path, datetime.fromtimestamp(time()))
-		return created1(ids, src_path, stat, is_directory,cursor)
+		return create1(ids, src_path, stat, is_directory,cursor)
 	return modify(ids[-1], stat, False, cursor)
 
 def created(src_path, stat, is_directory, is_synthetic, cursor):
@@ -859,7 +859,7 @@ def created(src_path, stat, is_directory, is_synthetic, cursor):
 		# если было удалено, но это не было зафиксировано, а потом создалось - считаем, что просто изменилось
 		print('do created as modified',src_path, datetime.fromtimestamp(time()))
 		return modify(ids[-1], stat, False, cursor)
-	return created1(ids, src_path, stat, is_directory,cursor)
+	return create1(ids, src_path, stat, is_directory,cursor)
 
 def deleted(src_path, is_directory, is_synthetic, cursor):
 	if VERBOSE>=2: print('deleted',src_path, is_directory, is_synthetic, cursor)
@@ -883,8 +883,8 @@ def moved(src_path, dest_path, stat, is_directory, is_synthetic, cursor):
 	ids = path2ids(src_path,cursor)
 	if ids[-1] is None:
 		print('do moved as created',src_path, dest_path, time())
-		return created1(ids, dest_path, stat, is_directory,cursor)
-	moved1(ids[-1],dest_path, cursor)
+		return created(dest_path, stat, is_directory, is_synthetic, cursor)
+	move(ids[-1],dest_path, cursor)
 
 # --------------------------------
 # интерфейсные функции
@@ -1010,28 +1010,37 @@ def watch(do_stat = True):
 		
 	def event_handler(event: FileSystemEvent) -> None:
 		if event.event_type=='closed_no_write':
+			if VERBOSE>=1: print('pass closed_no_write',event.src_path)
 			pass
 		elif event.event_type=='opened':
+			if VERBOSE>=1: print('pass opened',event.src_path)
 			pass
 		elif event.event_type=='modified' or event.event_type=='closed':
+			if VERBOSE>=1: print('modified',event.src_path)
 			try:
 				stat = os_stat(event.src_path)
-				modified(event.src_path, stat, event.is_directory, event.is_synthetic, CUR)
 			except FileNotFoundError as e:
-				print('error in modified event:', e, event.src_path, event.is_directory, event.is_synthetic)
+				print('error in modified event:', type(e), e, event.src_path, event.is_directory, event.is_synthetic)
+			else:
+				modified(event.src_path, stat, event.is_directory, event.is_synthetic, CUR)
 			
 		elif event.event_type=='created':
+			if VERBOSE>=1: print('created',event.src_path)
 			try:
 				stat = os_stat(event.src_path)
-				created(event.src_path, stat, event.is_directory, event.is_synthetic, CUR)
 			except FileNotFoundError as e:
-				print('error in created event:', e, event.src_path, event.is_directory, event.is_synthetic)
+				print('error in created event:', type(e), e, event.src_path, event.is_directory, event.is_synthetic)
+			else:
+				created(event.src_path, stat, event.is_directory, event.is_synthetic, CUR)
 		elif event.event_type=='deleted':
+			if VERBOSE>=1: print('deleted',event.src_path)
 			deleted(event.src_path, event.is_directory, event.is_synthetic, CUR)
 		elif event.event_type=='moved':
+			if VERBOSE>=1: print('moved',event.src_path,event.dest_path)
 			try:
 				stat = os_stat(event.dest_path)
 			except FileNotFoundError:
+				print('error in moved event:', type(e), e, event.src_path, event.dest_path, event.is_directory, event.is_synthetic)
 				stat = make_dict(st_mode=None,st_ino=None,st_dev=None,st_nlink=None,st_uid=None,st_gid=None,st_size=None,
 					   st_atime=None,st_mtime=None,st_ctime=None,st_blocks=None,st_blksize=None)
 			moved(event.src_path, event.dest_path, stat, event.is_directory, event.is_synthetic, CUR)
