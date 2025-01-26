@@ -844,7 +844,7 @@ def modified(src_path, stat, is_directory, is_synthetic, cursor):
 		return
 	ids = path2ids(src_path,cursor)
 	if ids[-1] is None:
-		print('do modified as created',src_path, datetime.fromtimestamp(time()))
+		if VERBOSE>=1.4: print('do modified as created',src_path, datetime.fromtimestamp(time()))
 		return create1(ids, src_path, stat, is_directory,cursor)
 	return modify(ids[-1], stat, False, cursor)
 
@@ -857,7 +857,7 @@ def created(src_path, stat, is_directory, is_synthetic, cursor):
 	ids = path2ids(src_path,cursor)
 	if ids[-1] is not None:
 		# если было удалено, но это не было зафиксировано, а потом создалось - считаем, что просто изменилось
-		print('do created as modified',src_path, datetime.fromtimestamp(time()))
+		if VERBOSE>=1.4: print('do created as modified',src_path, datetime.fromtimestamp(time()))
 		return modify(ids[-1], stat, False, cursor)
 	return create1(ids, src_path, stat, is_directory,cursor)
 
@@ -869,7 +869,7 @@ def deleted(src_path, is_directory, is_synthetic, cursor):
 		return
 	ids = path2ids(src_path,cursor)
 	if ids[-1] is None:
-		print('deleted unknown object:',src_path)
+		if VERBOSE>=1.4: print('error in deleted: unknown object:',src_path)
 		return
 	delete(ids[-1], False, cursor)
 
@@ -882,7 +882,7 @@ def moved(src_path, dest_path, stat, is_directory, is_synthetic, cursor):
 		return
 	ids = path2ids(src_path,cursor)
 	if ids[-1] is None:
-		print('do moved as created',src_path, dest_path, time())
+		if VERBOSE>=1.4: print('do moved as created',src_path, dest_path, time())
 		return created(dest_path, stat, is_directory, is_synthetic, cursor)
 	move(ids[-1],dest_path, cursor)
 
@@ -972,6 +972,8 @@ def help_owner():
 		delete(owner, stric = False)
 		set(path, owner, *, save=None, update=False, in_deleted=False, del_hist=False)
 		hashes(with_all=True)
+		stat_all()
+		stat_modified()
 		help()
 		''')
 
@@ -1010,37 +1012,37 @@ def watch(do_stat = True):
 		
 	def event_handler(event: FileSystemEvent) -> None:
 		if event.event_type=='closed_no_write':
-			if VERBOSE>=1: print('pass closed_no_write',event.src_path)
+			if VERBOSE>=1.5: print('pass closed_no_write',event.src_path)
 			pass
 		elif event.event_type=='opened':
-			if VERBOSE>=1: print('pass opened',event.src_path)
+			if VERBOSE>=1.5: print('pass opened',event.src_path)
 			pass
 		elif event.event_type=='modified' or event.event_type=='closed':
-			if VERBOSE>=1: print('modified',event.src_path)
+			if VERBOSE>=1.5: print('modified',event.src_path)
 			try:
 				stat = os_stat(event.src_path)
 			except FileNotFoundError as e:
-				print('error in modified event:', type(e), e, event.src_path, event.is_directory, event.is_synthetic)
+				if VERBOSE>=1.4: print('error in modified event:', type(e), e, event.src_path, event.is_directory, event.is_synthetic)
 			else:
 				modified(event.src_path, stat, event.is_directory, event.is_synthetic, CUR)
 			
 		elif event.event_type=='created':
-			if VERBOSE>=1: print('created',event.src_path)
+			if VERBOSE>=1.5: print('created',event.src_path)
 			try:
 				stat = os_stat(event.src_path)
 			except FileNotFoundError as e:
-				print('error in created event:', type(e), e, event.src_path, event.is_directory, event.is_synthetic)
+				if VERBOSE>=1.4: print('error in created event:', type(e), e, event.src_path, event.is_directory, event.is_synthetic)
 			else:
 				created(event.src_path, stat, event.is_directory, event.is_synthetic, CUR)
 		elif event.event_type=='deleted':
-			if VERBOSE>=1: print('deleted',event.src_path)
+			if VERBOSE>=1.5: print('deleted',event.src_path)
 			deleted(event.src_path, event.is_directory, event.is_synthetic, CUR)
 		elif event.event_type=='moved':
-			if VERBOSE>=1: print('moved',event.src_path,event.dest_path)
+			if VERBOSE>=1.5: print('moved',event.src_path,event.dest_path)
 			try:
 				stat = os_stat(event.dest_path)
 			except FileNotFoundError:
-				print('error in moved event:', type(e), e, event.src_path, event.dest_path, event.is_directory, event.is_synthetic)
+				if VERBOSE>=1.4: print('error in moved event:', type(e), e, event.src_path, event.dest_path, event.is_directory, event.is_synthetic)
 				stat = make_dict(st_mode=None,st_ino=None,st_dev=None,st_nlink=None,st_uid=None,st_gid=None,st_size=None,
 					   st_atime=None,st_mtime=None,st_ctime=None,st_blocks=None,st_blksize=None)
 			moved(event.src_path, event.dest_path, stat, event.is_directory, event.is_synthetic, CUR)
@@ -1120,6 +1122,8 @@ def watch(do_stat = True):
 							if fun=='rename': rename_owner(*args,**kwargs)
 							if fun=='set': set_owner(*args,**kwargs)
 							if fun=='hashes': update_hashes(*args,**kwargs, modify=modify)
+							if fun=='stat_all': walk_stat_all(*args,**kwargs)
+							if fun=='stat_modified': walk_stat_modified(*args,**kwargs)
 							if fun=='help': help_owner(*args,**kwargs)
 						except Exception as e:
 							print(e)
