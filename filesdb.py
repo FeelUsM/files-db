@@ -393,6 +393,8 @@ class filesdb:
 		по fid-у заполняет stat-поля в cur_stat
 		'''
 		if cursor is None: cursor = self.CUR
+		(typ,) = cursor.execute('SELECT type FROM cur_stat WHERE id = ?',(fid,)).fetchone()
+		assert typ == simple_type(stat.st_mode), (fid,typ, simple_type(stat.st_mode), stat.st_mode)
 		cursor.execute('''UPDATE cur_stat SET
 			st_mode=?,st_ino=?,st_dev=?,st_nlink=?,st_uid=?,st_gid=?,st_size=?,
 			st_atime=?,st_mtime=?,st_ctime=?,st_blocks=?,st_blksize=? WHERE id = ?''',
@@ -891,6 +893,8 @@ class filesdb:
 		(_,save) = self.owner_save(fid,cursor)
 		if save:
 			self.add_event(fid, None, EMOVE, False, cursor)
+		if (n:=cursor.execute('SELECT id FROM cur_dirs WHERE parent_id=? AND name=?',(parent_id, name)).fetchone()) is not None and n[0]!=fid:
+			self.delete(n[0],False)
 		cursor.execute('UPDATE cur_dirs SET parent_id = ?, name = ? WHERE id = ?',(parent_id, name, fid))
 
 	def modified(self, src_path, stat, is_directory, is_synthetic, cursor=None):
@@ -1106,10 +1110,10 @@ class filesdb:
 				try:
 					stat = os_stat(event.dest_path)
 				except FileNotFoundError:
-					if VERBOSE>=1.4: print('error in moved event:', type(e), e, event.src_path, event.dest_path, event.is_directory, event.is_synthetic)
-					stat = make_dict(st_mode=None,st_ino=None,st_dev=None,st_nlink=None,st_uid=None,st_gid=None,st_size=None,
-						   st_atime=None,st_mtime=None,st_ctime=None,st_blocks=None,st_blksize=None)
-				self.moved(event.src_path, event.dest_path, stat, event.is_directory, event.is_synthetic, self.CUR)
+					if VERBOSE>=1.4: print('do moved as deleted:', type(e), e, event.src_path, event.dest_path, event.is_directory, event.is_synthetic)
+					self.deleted(event.src_path, event.is_directory, event.is_synthetic, self.CUR)
+				else:
+					self.moved(event.src_path, event.dest_path, stat, event.is_directory, event.is_synthetic, self.CUR)
 			else:
 				raise Exception(event)
 
@@ -1475,7 +1479,7 @@ class filesdb:
 			root_dirs = [os.path.abspath(x) for x in root_dirs]
 			self.FILES_DB = files_db
 			self.CON = sqlite3.connect(self.FILES_DB)
-			CUR = self.CON.cursor()
+			self.CUR = self.CON.cursor()
 			self.ROOT_DIRS = root_dirs
 			self.init_db(nohash)
 			if not nocheck:
@@ -1492,7 +1496,7 @@ class filesdb:
 			print(f'filesdb({repr(self.FILES_DB)}): lost running commit thread')
 
 	def execute(self,*args,**kwargs):
-		ith self.CON:
+		with self.CON:
 			return self.CUR.execute(*args,**kwargs)
 
 if __name__ == "__main__":
