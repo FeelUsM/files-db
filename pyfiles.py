@@ -972,7 +972,8 @@ class filesdb:
 				if self.CUR.execute('SELECT * FROM owners WHERE name = ?',(name,)).fetchone() is None:
 					raise Exception('such owner does not exist')
 			self.CUR.execute('DELETE FROM owners WHERE name = ?',(owner,))
-
+			self.CUR.execute('UPDATE cur_stat SET owner = NULL WHERE owner = (SELECT id FROM owners WHERE name = ?)',(name,))
+		
 	def set_owner(self, path, owner, *, save=None, update=False, in_deleted=False, del_hist=False):
 		'''
 		если такого owner-а еще нет - он создаётся
@@ -996,6 +997,7 @@ class filesdb:
 					oid = None
 
 				def my_walk(did):
+					#print('my_walk',did)
 					if del_hist:
 						cursor.execute('DELETE FROM hist WHERE id = ?',(did,))
 					if update:
@@ -1016,11 +1018,10 @@ class filesdb:
 							cursor.execute('UPDATE deleted SET owner = ? WHERE id = ?',(oid,fid))
 							my_walk(fid)
 
-				fid = self.path2ids(path,cursor)[-1]
+				fid = self.path2ids_hist(path,cursor)[0][-1]
 				cursor.execute('UPDATE cur_stat SET owner = ? WHERE id = ?',(oid,fid))
-				(typ,) = cursor.execute('SELECT type FROM cur_dirs WHERE id = ?',(fid,)).fetchone()
-				if typ==MDIR:
-					my_walk(fid)
+				# todo ошибка
+				my_walk(fid)
 				if del_hist:
 					cursor.execute('DELETE FROM hist WHERE id = ?',(fid,))
 				return fid
@@ -1073,7 +1074,7 @@ class filesdb:
 		#	def moved(src_path, dest_path, stat, is_directory, is_synthetic, cursor):
 		#		print('moved',src_path)
 			
-		def event_handler(event: FileSystemEvent) -> None:
+		def my_event_handler(event: FileSystemEvent) -> None:
 			if event.event_type=='closed_no_write':
 				if VERBOSE>=1.5: print('pass closed_no_write',event.src_path)
 				pass
@@ -1143,20 +1144,19 @@ class filesdb:
 				except EOFError:
 					x = 'q'
 				q.put(x)
-		if self.keyboard_thr is None:
+		if self.keyboard_thr is None or not self.keyboard_thr.is_alive():
 			self.keyboard_thr = threading.Thread(target = keyboard_monitor, args=tuple(), name='keyboard_thr', daemon=True)
-		if not self.keyboard_thr.is_alive():
 			self.keyboard_thr.start()
 		else:
 			print('keep old keyboard_thr')
 
+		stopped = False
 		def commit_monitor():
-			while True:
+			while not stopped:
 				sleep(60)
 				q.put('u')
-		if self.commit_thr is None:
+		if self.commit_thr is None or not self.commit_thr.is_alive():
 			self.commit_thr = threading.Thread(target = commit_monitor, args=tuple(), name='commit_thr', daemon=True)
-		if not self.commit_thr.is_alive():
 			self.commit_thr.start()
 		else:
 			print('keep old commit_thr')
@@ -1165,11 +1165,12 @@ class filesdb:
 			while True:
 				event = q.get()
 				if isinstance(event,FileSystemEvent):
-					event_handler(event)
+					my_event_handler(event)
 				elif type(event) is str:
 					if event=='q':
 						if self.CON.in_transaction:
 							self.CUR.execute('COMMIT')
+							stopped = True
 						break
 					elif event=='u':
 						if self.CON.in_transaction:
@@ -1405,6 +1406,10 @@ class filesdb:
 		my_walk(fid,deleted,owner)
 
 		print('unused:')
+		for (oid, oname) in self.CUR.execute('''SELECT id, name  FROM owners WHERE id NOT IN 
+				(SELECT owner AS id FROM cur_stat WHERE owner NOT NULL UNION SELECT owner AS id FROM deleted WHERE owner NOT NULL)'''):
+			print(oid, oname, sep='\t')
+		print('------')
 
 	# ------------------------------------
 	# инициализация приложения/библиотеки
@@ -1482,9 +1487,13 @@ class filesdb:
 	def __del__(self):
 		self.CON.close()
 		if self.keyboard_thr is not None and self.keyboard_thr.is_alive():
-			print(f'dilesdb({repr(self.FILES_DB)}): lost running keyboard thread')
+			print(f'filesdb({repr(self.FILES_DB)}): lost running keyboard thread')
 		if self.commit_thr is not None and self.commit_thr.is_alive():
-			print(f'dilesdb({repr(self.FILES_DB)}): lost running commit thread')
+			print(f'filesdb({repr(self.FILES_DB)}): lost running commit thread')
+
+	def execute(self,*args,**kwargs):
+		ith self.CON:
+			return self.CUR.execute(*args,**kwargs)
 
 if __name__ == "__main__":
 	import sys
