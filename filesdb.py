@@ -18,12 +18,13 @@ def make_dict(**kwargs):
 	return AttrDict(kwargs)
 
 
-VERBOSE = 1
-# 1 - сообщать о внесеннии изменений в образ ФС
+VERBOSE = 0.5
+# 0.5 - сообщать об изменениях объектов, которые не имеют владельцев
+# 1   - сообщать о внесеннии изменений в образ ФС
 # 1.4 - сообщать о несоответствяих ФС, её образа и событий
 # 1.5 - сообщать о событиях
-# 2 - stat_eq и все функции событий
-# 3 - owner_save
+# 2   - stat_eq и все функции событий
+# 3   - owner_save
 
 # cur_dirs:modified
 # 2 - pre-root-dir
@@ -285,7 +286,7 @@ class filesdb:
 			для modified в modified или pre-root_dir
 		у всех из cur_dirs (кроме root_dir) есть обаз из cur_stat и наоборот
 		для всех из hist есть образ в cur_stat или deleted
-		для всех из cur_stat у кого owner is not None есть owner в owners
+		для всех из cur_stat, deleted, hist у кого owner is not None есть owner в owners
 		cur_dirs.type  cur_stat.type = simple_type(cur_stat.st_mode)
 		todo проверка всех констант (cur_dirs.type, cur_dirs.modified, hist.type, hist.event_type, hist.static_found, owners.save)
 		'''
@@ -332,10 +333,12 @@ class filesdb:
 		hist_ids = {x[0] for x in self.CUR.execute('SELECT id FROM hist').fetchall()}
 		assert hist_ids <= (notroot_dirs_ids|deleted_ids), f'hist enty with unknown id: {hist_ids-(notroot_dirs_ids|deleted_ids)}'
 
-		# для всех из cur_stat у кого owner is not None есть owner в owners
+		# для всех из cur_stat, deleted, hist у кого owner is not None есть owner в owners
 		stat_owners = {x[0] for x in self.CUR.execute('SELECT owner FROM cur_stat WHERE owner NOT NULL').fetchall()}
+		deleted_owners = {x[0] for x in self.CUR.execute('SELECT owner FROM deleted WHERE owner NOT NULL').fetchall()}
+		hist_owners = {x[0] for x in self.CUR.execute('SELECT owner FROM hist WHERE owner NOT NULL').fetchall()}
 		owners = {x[0] for x in self.CUR.execute('SELECT id FROM owners').fetchall()}
-		assert stat_owners <= owners, f'lost owner: {stat_owners - owners}'
+		assert (stat_owners|deleted_owners|hist_owners) <= owners, f'lost owners : {(stat_owners|deleted_owners|hist_owners) - owners}'
 
 		# cur_dirs.type  cur_stat.type = simple_type(cur_stat.st_mode)
 		for (t1, t2, mode) in self.CUR.execute('SELECT cur_dirs.type, cur_stat.type, cur_stat.st_mode FROM cur_dirs JOIN cur_stat ON cur_dirs.id=cur_stat.id').fetchall():
@@ -547,7 +550,18 @@ class filesdb:
 			cur_id = n[0]
 			ids.append(cur_id)
 		return ids, deleted
-		
+
+	def any2id(self,fid):
+		if fid is None:
+			fid = os.getcwd()
+		if type(fid) is str: return self.path2ids(normalize_path(os.path.abspath(fid)))[-1]
+		else:                return fid
+	def any2id_hist(self,fid):
+		if fid is None:
+			fid = os.getcwd()
+		if type(fid) is str: return self.path2ids_hist(normalize_path(os.path.abspath(fid)))[0][-1]
+		else:                return fid
+
 	def owner_save(self,fid,cursor=None):
 		'''
 		определяет владельца и надо ли сохранять события, связанные с этим файлом
@@ -561,7 +575,7 @@ class filesdb:
 			save = True
 		return (owner,save)
 
-	def add_event(self, fid, typ, etyp, static_found, cursor=None):
+	def add_event(self, fid, typ, etyp, static_found, owner, cursor=None):
 		'''
 		создает запись в hist
 		если событие ECREAT: заполняет большинство полей -1
@@ -571,16 +585,19 @@ class filesdb:
 		if cursor is None: cursor = self.CUR
 		ltime = time()
 		if etyp==ECREAT:
-			if VERBOSE:
-				print(datetime.fromtimestamp(ltime), etyp2str(etyp), static_found, fid, typ2str(typ), self.id2path_hist(fid,cursor)[0])
+			if VERBOSE>0.5 or owner is None:
+				if VERBOSE >0:
+					print(datetime.fromtimestamp(ltime), etyp2str(etyp), static_found, fid, typ2str(typ), self.id2path_hist(fid,cursor)[0])
+				if VERBOSE==0:
+					pass # todo notificatrion
 			cursor.execute('''INSERT INTO hist (
 					parent_id, name,
 					id, type, event_type,
 					st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,st_atime,st_mtime,st_ctime,st_blocks,st_blksize,
 					data,owner,
 					time,static_found
-				) VALUES (-1,'',?,?,?,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,'',-1,?,?)''',
-						   (fid,typ,etyp,ltime,static_found))
+				) VALUES (-1,'',?,?,?,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,'',?,?,?)''',
+						   (fid,typ,etyp,owner,ltime,static_found))
 		else:
 			(otyp,) = cursor.execute('SELECT type FROM cur_dirs WHERE id = ?',(fid,)).fetchone()
 			if typ is not None:
@@ -635,12 +652,12 @@ class filesdb:
 				if n is not None: # раньше этот файл уже обновлялся
 					save = abs(n[0] - time())>10
 			if save:
-				self.add_event(fid, simple_type(stat.st_mode), EMODIF, static_found, cursor)
+				self.add_event(fid, simple_type(stat.st_mode), EMODIF, static_found, owner, cursor)
 		
 	def create(self, parent_id, name, stat, static_found, cursor=None, owner=None, save=None):
 		'''
 		создается объект, родительская директория которого уже существует
-		как правило save, owner определяются родительской папкой
+		save, owner определяются родительской папкой или 
 		возвращает fid созданного объекта
 		'''
 		if cursor is None: cursor = self.CUR
@@ -670,7 +687,7 @@ class filesdb:
 		self.update_stat(fid,stat,cursor)
 
 		if save:
-			self.add_event(fid, simple_type(stat.st_mode), ECREAT, static_found, cursor)
+			self.add_event(fid, simple_type(stat.st_mode), ECREAT, static_found, owner, cursor)
 
 		return fid
 		
@@ -689,7 +706,7 @@ class filesdb:
 				if ftype==MDIR:
 					my_walk(fid)
 				if save:
-					self.add_event(fid, None, EDEL, static_found, cursor)
+					self.add_event(fid, None, EDEL, static_found, owner, cursor)
 
 				(owner,) = cursor.execute('SELECT owner FROM cur_stat WHERE id = ?', (fid,)).fetchone()
 				cursor.execute('''INSERT INTO deleted VALUES (?,?,?,?) ON CONFLICT DO UPDATE SET
@@ -700,7 +717,7 @@ class filesdb:
 				
 		my_walk(fid)
 		if save:
-			self.add_event(fid, None, EDEL, static_found, cursor)
+			self.add_event(fid, None, EDEL, static_found, owner, cursor)
 
 		(owner,) = cursor.execute('SELECT owner FROM cur_stat WHERE id = ?', (fid,)).fetchone()
 		(did,name) = cursor.execute('SELECT parent_id, name FROM cur_dirs WHERE id = ?', (fid,)).fetchone()
@@ -769,6 +786,7 @@ class filesdb:
 										modify(fid, os_stat(self.id2path(fid)), 2, cursor)
 								lhsh = hashlib.md5(lnk.encode()).hexdigest()
 								cursor.execute('UPDATE cur_stat SET data = ? WHERE id = ?',(lnk,fid))
+								cursor.execute('UPDATE cur_dirs SET modified = 0 WHERE id = ?',(fid,))
 							except FileNotFoundError:
 								self.set_modified(fid, cursor)
 								lhsh = None
@@ -779,6 +797,7 @@ class filesdb:
 								(lhsh,) = cursor.execute('SELECT data FROM cur_stat WHERE id = ?',(fid,)).fetchone()
 						elif ftype==MOTHER:
 							lhsh = hex( 0 )[2:].zfill(32)
+							cursor.execute('UPDATE cur_dirs SET modified = 0 WHERE id = ?',(fid,))
 						else:
 							assert False, (name,fid,ftype)
 
@@ -920,9 +939,9 @@ class filesdb:
 		if cursor is None: cursor = self.CUR
 		if VERBOSE>=2: print('moved',fid, dest_path, cursor)
 		(parent_id, _, _, name) = self.create_parents(dest_path,cursor)
-		(_,save) = self.owner_save(fid,cursor)
+		(owner,save) = self.owner_save(fid,cursor)
 		if save:
-			self.add_event(fid, None, EMOVE, False, cursor)
+			self.add_event(fid, None, EMOVE, False, owner, cursor)
 		if (n:=cursor.execute('SELECT id FROM cur_dirs WHERE parent_id=? AND name=?',(parent_id, name)).fetchone()) is not None and n[0]!=fid:
 			self.delete(n[0],False)
 		cursor.execute('UPDATE cur_dirs SET parent_id = ?, name = ? WHERE id = ?',(parent_id, name, fid))
@@ -985,46 +1004,91 @@ class filesdb:
 	# интерфейсные функции
 	# --------------------------------
 	def reset_modified(self):
+		'''
+		сбрасывает все modified флаги
+		'''
 		with self.CON:
 			self.CUR.execute('UPDATE cur_dirs SET modified =0 WHERE modified==1')
 
 	def create_owner(self, name, save):
+		'''
+		создает владельца, возвращает его id
+		'''
 		with self.CON:
 			self.CUR.execute('INSERT INTO owners (name, save) VALUES (?, ?)', (name,save))
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 
 	def update_owner(self, name, save):
+		'''
+		у существующего владельца обновляет параметр save, возвращает его id
+		'''
 		with self.CON:
-			self.CUR.execute('UPDATE owners SET name = ?, save = ? ', (name,save))
+			self.CUR.execute('UPDATE owners SET save = ? WHERE name = ?', (save,name))
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 
 	def credate_owner(self, name, save):
+		'''
+		создаёт владельца, а если он уже существует, то только обновляет его параметр save. Возвращает его id
+		'''
 		with self.CON:
 			self.CUR.execute('''INSERT INTO owners (name, save) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET
 				name = excluded.name,    save = excluded.save ''', (name,save))
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 
 	def del_owner(self, owner):
+		'''
+		удаляет владельца и все упоминания о нём из таблиц hist, cur_stat, deleted
+		'''
 		with self.CON:
-			self.CUR.execute('UPDATE hist SET owner = NULL WHERE owner = (SELECT id FROM owners WHERE name = ?)',(owner,))
-			self.CUR.execute('UPDATE cur_stat SET owner = NULL WHERE owner = (SELECT id FROM owners WHERE name = ?)',(owner,))
+			self.CUR.execute('UPDATE cur_stat SET cur_stat.owner = NULL WHERE cur_stat.owner = (SELECT owners.id FROM owners WHERE owners.name = ?)',(owner,))
+			self.CUR.execute('UPDATE deleted  SET deleted.owner  = NULL WHERE deleted.owner  = (SELECT owners.id FROM owners WHERE owners.name = ?)',(owner,))
+			self.CUR.execute('UPDATE hist     SET hist.owner     = NULL WHERE hist.owner     = (SELECT owners.id FROM owners WHERE owners.name = ?)',(owner,))
 			self.CUR.execute('DELETE FROM owners WHERE name = ?',(owner,))
 		
 	def del_owner_hist(self, owner):
+		'''
+		удаляет владельца и все упоминания о нём из таблиц cur_stat, deleted
+		а также удалает из hist все записи, в которых упоминается этот владелец
+		'''
 		with self.CON:
-			self.CUR.execute('DELETE FROM hist WHERE owner = (SELECT id FROM owners WHERE name = ?)',(owner,))
-			self.CUR.execute('UPDATE cur_stat SET owner = NULL WHERE owner = (SELECT id FROM owners WHERE owner = ?)',(owner,))
+			self.CUR.execute('UPDATE cur_stat SET cur_stat.owner = NULL WHERE cur_stat.owner = (SELECT owners.id FROM owners WHERE owners.name = ?)',(owner,))
+			self.CUR.execute('UPDATE deleted  SET deleted.owner  = NULL WHERE deleted.owner  = (SELECT owners.id FROM owners WHERE owners.name = ?)',(owner,))
+			self.CUR.execute('DELETE FROM hist                          WHERE hist.owner     = (SELECT owners.id FROM owners WHERE owners.name = ?)',(owner,))
 			self.CUR.execute('DELETE FROM owners WHERE name = ?',(owner,))
-		
-	def del_hist_owner(self, owner, interval=None):
-		#todo interval
-		with self.CON:
-			self.CUR.execute('DELETE FROM hist WHERE owner = (SELECT id FROM owners WHERE name = ?)',(owner,))
 
-	def del_hist_id(self, id, interval=None):
+	def del_hist_owner(self, owner, interval=None):
+		'''
+		удалает из hist все записи, в которых упоминается этот владелец
+		'''
 		#todo interval
 		with self.CON:
-			self.CUR.execute('DELETE FROM hist WHERE id = ?)',(id,))
+			self.CUR.execute('DELETE FROM hist WHERE hist.owner = (SELECT owners.id FROM owners WHERE owners.name = ?)',(owner,))
+
+	def del_hist_id(self, fid, interval=None):
+		'''
+		удаляет из истории все записи про заданный объект
+		'''
+		#todo interval
+		fid = any2id_hist(fid)
+		with self.CON:
+			self.CUR.execute('DELETE FROM hist WHERE id = ?)',(fid,))
+
+	def del_hist_id_recursive(self, fid, interval=None):
+		'''
+		удаляет из истории все записи про заданный объект и его дочерние объекты
+		'''
+		#todo interval
+		fid = any2id_hist(fid)
+		with self.CON:
+			self.CUR.execute('DELETE FROM hist WHERE id = ?)',(fid,))
+			fids = self.CUR.execute('SELECT id FROM cur_dirs WHERE parent_id = ? JOIN SELECT id FROM deleted  WHERE parent_id = ?',(fid,fid)).fetchall()
+			while len(fids)>0:
+				self.CUR.executemany('DELETE FROM hist WHERE id = ?)',fids)
+				fids2 = []
+				for (fid,) in fids:
+					fids2+= self.CUR.execute('SELECT id FROM cur_dirs WHERE parent_id = ?',(fid,)).fetchall()
+					fids2+= self.CUR.execute('SELECT id FROM deleted  WHERE parent_id = ?',(fid,)).fetchall()
+				fids = fids2
 
 	def rename_owner(self, oname, name):
 		with self.CON:
@@ -1040,7 +1104,6 @@ class filesdb:
 			если False - только для тех вложенных, у которых еще нет owner-а или он такой как у объекта path
 		in_deleted - устанавливать ли owner-а для удалённых объектов
 		'''
-		path = os.path.abspath(path)
 		with self.CON:
 			with closing(self.CON.cursor()) as cursor:
 				# oid - owner-id, который будем устанавливать
@@ -1054,7 +1117,7 @@ class filesdb:
 					if replace_inner:
 						n = cursor.execute('SELECT name,id,type FROM cur_dirs WHERE parent_id = ? ',(did,)).fetchall()
 					else:
-						n = cursor.execute('''SELECT name, cur_dirs.id, cur_dirs.type FROM cur_dirs JOIN cur_stat ON cur_dirs.id=cur_stat.id
+						n = cursor.execute('''SELECT cur_dirs.name, cur_dirs.id, cur_dirs.type FROM cur_dirs JOIN cur_stat ON cur_dirs.id=cur_stat.id
 							WHERE cur_dirs.parent_id = ? AND cur_stat.owner ISNULL''',(did,)).fetchall()
 					for name,fid,ftype in n:
 						cursor.execute('UPDATE cur_stat SET owner = ? WHERE id = ?',(oid,fid))
@@ -1069,7 +1132,7 @@ class filesdb:
 							cursor.execute('UPDATE deleted SET owner = ? WHERE id = ?',(oid,fid))
 							my_walk(fid)
 
-				fid = self.path2ids_hist(path,cursor)[0][-1]
+				fid = self.any2id_hist(path)
 				cursor.execute('UPDATE cur_stat SET owner = ? WHERE id = ?',(oid,fid))
 				# todo ошибка
 				my_walk(fid)
@@ -1118,6 +1181,7 @@ class filesdb:
 		db_mode = self.CUR.execute("PRAGMA journal_mode=WAL;").fetchone()
 		assert db_mode==('wal',), db_mode
 
+		self.check_integrity()
 		if do_stat:
 			print('start walk_stat_all')
 			self.walk_stat_all()
@@ -1387,12 +1451,12 @@ class filesdb:
 		if info.modified!=2:
 			if info.deleted:
 				s+='D'
+			if info.modified:
+				s+='M'
 			if info.count>0:
 				s+=str(info.count - info.count_static)
 				if info.count_static>0:
 					s+='+'+str(info.count_static)
-			elif info.modified:
-				s+='M'
 		out_data.append(s)
 
 		# root-fid
@@ -1468,12 +1532,7 @@ class filesdb:
 		return out_data
 
 	def ls(self, fid=None,*,info_lev=1):
-		if fid is None:
-			fid = os.getcwd()
-		if type(fid) is str:
-			fid = os.path.abspath(fid)
-			ids = self.path2ids(fid,self.CUR)
-			fid = ids[-1]
+		fid = self.any2id(fid)
 		print(*self.format_info(self.info_fid(fid), info_lev=0),sep='\t')
 		for (fid,) in self.CUR.execute('SELECT id FROM cur_dirs WHERE parent_id = ?',(fid,)).fetchall():
 			print(*self.format_info(self.info_fid(fid), info_lev=info_lev),sep='\t')
@@ -1487,23 +1546,18 @@ class filesdb:
 		modified
 		'''
 		assert where in ['all', 'hist_owner', 'hist_noowner', 'modified']
-		if fid is None:
-			fid = os.getcwd()
-		if type(fid) is str:
-			fid = os.path.abspath(fid)
-			ids = self.path2ids(fid,self.CUR)
-			fid = ids[-1]
+		fid = self.any2id(fid)
 		print(*self.format_info(self.info_fid(fid), info_lev=0),sep='\t')
 		nest_reducer = (len(self.path2ids(self.id2path(fid))))
 		if where=='hist_owner': 
-			fids = set(self.CUR.execute('SELECT cur_stat.id FROM cur_stat JOIN hist ON cur_stat.id==hist.id WHERE cur_stat.owner NOT NULL').fetchall())
-			fidsd = set(self.CUR.execute('SELECT deleted.id FROM deleted JOIN hist ON deleted.id==hist.id WHERE deleted.owner NOT NULL').fetchall())
+			fids                   = set(self.CUR.execute('SELECT cur_stat.id FROM cur_stat JOIN hist ON cur_stat.id==hist.id WHERE cur_stat.owner NOT NULL').fetchall())
+			if show_deleted: fidsd = set(self.CUR.execute('SELECT  deleted.id FROM deleted  JOIN hist ON deleted.id ==hist.id WHERE deleted.owner  NOT NULL').fetchall())
 		if where=='hist_noowner': 
-			fids = set(self.CUR.execute('SELECT cur_stat.id FROM cur_stat JOIN hist ON cur_stat.id==hist.id WHERE cur_stat.owner IS NULL').fetchall())
-			fidsd = set(self.CUR.execute('SELECT deleted.id FROM deleted JOIN hist ON deleted.id==hist.id WHERE deleted.owner IS NULL').fetchall())
+			fids                   = set(self.CUR.execute('SELECT cur_stat.id FROM cur_stat JOIN hist ON cur_stat.id==hist.id WHERE cur_stat.owner IS NULL').fetchall())
+			if show_deleted: fidsd = set(self.CUR.execute('SELECT  deleted.id FROM deleted  JOIN hist ON deleted.id ==hist.id WHERE deleted.owner  IS NULL').fetchall())
 		if where=='modified': 
-			fids = set(self.CUR.execute('SELECT id FROM cur_dirs WHERE modified>0').fetchall())
-			fidsd = set()
+			fids                   = set(self.CUR.execute('SELECT id FROM cur_dirs WHERE modified>0').fetchall())
+			if show_deleted: fidsd = set()
 		#print(fids)
 		#print(fidsd)
 
@@ -1555,8 +1609,7 @@ class filesdb:
 		# format: save owner fid deleted path
 		(fid,deleted) = self.path2ids_hist(path,self.CUR)
 		fid = fid[-1]
-		if fid is None:
-			raise Exception('path does not exist')
+		(fid,deleted) = self.any2id(fid)
 		if deleted:
 			n = self.CUR.execute('SELECT owners.save, owners.name, owners.id FROM owners JOIN deleted ON owners.id=deleted.owner WHERE deleted.id = ?',(fid,)).fetchone()
 		else:
@@ -1583,8 +1636,8 @@ class filesdb:
 		my_walk(fid,deleted,owner)
 
 	def unused_owners(self):
-		for (oid, oname) in self.CUR.execute('''SELECT id, name  FROM owners WHERE id NOT IN 
-				(SELECT owner AS id FROM cur_stat WHERE owner NOT NULL UNION SELECT owner AS id FROM deleted WHERE owner NOT NULL)'''):
+		for (oid, oname) in self.CUR.execute('''SELECT owners.id, owners.name  FROM owners WHERE owners.id NOT IN 
+				(SELECT cur_stat.owner AS id FROM cur_stat WHERE cur_stat.owner NOT NULL UNION SELECT deleted.owner AS id FROM deleted WHERE deleted.owner NOT NULL)'''):
 			print(oid, oname, sep='\t')
 
 	def all_info(self, show_deleted=True):
