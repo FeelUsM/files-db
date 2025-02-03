@@ -7,6 +7,7 @@ from time import time, sleep
 from datetime import datetime
 from contextlib import closing
 from traceback import print_exception, extract_stack, extract_tb, format_list
+import subprocess
 
 class AttrDict(dict):
 	def __getattr__(self, key):
@@ -141,14 +142,16 @@ def get_groupname_by_gid(gid):
 		return None  # Если UID не существует
 def access2str(st_mode):
 	mode = STAT.S_IMODE(st_mode)
-	assert mode < 2**10, mode
+	assert mode < 2**11, mode
 	s = ''
 	for i in range(6,-1,-3):
 		s+= 'r' if mode & 2**(i+2) else '-'
 		s+= 'w' if mode & 2**(i+1) else '-'
 		s+= 'x' if mode & 2**(i+0) else '-'
 	if mode & 2**9:
-		return s[:-1]+ ('t' if mode & 1 else 'T')
+		s = s[:-1]+ ('t' if mode & 1 else 'T')
+	if mode & 2**10:
+		s = s[:5]+ ('s' if mode & 16 else 'S') + s[6:]
 	return s
 
 
@@ -162,14 +165,34 @@ class filesdb:
 	# 1.5 - сообщать о событиях
 	# 2   - stat_eq и все функции событий
 	# 3   - owner_save
+	last_notification = time()
 
 	def notify(self, thr, *args, **kwargs):
 		assert type(thr) in (int,float)
 		if self.VERBOSE>=thr:
 			print(*args, **kwargs)
-			if __name__=='__main__':
+			if __name__=='__main__' and time() > self.last_notification+2:
+				self.last_notification = time()
 				sep = kwargs['sep'] if 'sep' in kwargs else ' '
-				os.system('notify-send "filesdb: '+sep.join(str(x) for x in args)+'"')
+				message = sep.join(str(x) for x in args)
+				if os.getuid()==0:
+					try:
+						username = 'feelus'
+						title = 'filesdb:'
+						# Получаем DBUS_SESSION_BUS_ADDRESS
+						dbus_address = subprocess.check_output(
+							f"grep -z DBUS_SESSION_BUS_ADDRESS /proc/$(pgrep -u {username} gnome-session | head -n1)/environ | tr '\\0' '\\n' | sed 's/DBUS_SESSION_BUS_ADDRESS=//'",
+							shell=True, text=True
+						).strip()
+						# Отправляем уведомление через sudo
+						subprocess.run(
+							["sudo", "-u", username, f"DBUS_SESSION_BUS_ADDRESS={dbus_address}", "notify-send", title, message],
+							check=True
+						)
+					except subprocess.CalledProcessError as e:
+						print(f"Ошибка при отправке уведомления: {e}")
+				else:
+					os.system('notify-send filesdb: "'+message+'"')
 
 	def raise_notify(self,e,*args):
 		'''
@@ -183,7 +206,7 @@ class filesdb:
 			print()
 			print("Traceback (most recent call last):")
 			print("".join(format_list(extract_stack()[:-2])), end="")
-			print(*args)
+			self.notify(0,*args)
 			print("--------------------------")
 		else:
 			elocal = args[0] if len(args)==1 and isinstance(args[0],Exception) else Exception(*args)
@@ -322,14 +345,13 @@ class filesdb:
 		у каждого существует родитель
 			для cur_dirs в cur_dirs
 			для deleted в cur_dirs или deleted
-			для hist в cur_dirs или deleted
 			для pre-root_dir в pre-root_dir
 			для modified в modified или pre-root_dir
 		у всех из cur_dirs (кроме root_dir) есть обаз из cur_stat и наоборот
-		для всех из hist есть образ в cur_stat или deleted
-		для всех из cur_stat, deleted, hist у кого owner is not None есть owner в owners
+		для всех из cur_stat, deleted у кого owner is not None есть owner в owners
 		cur_dirs.type  cur_stat.type = simple_type(cur_stat.st_mode)
 		todo проверка всех констант (cur_dirs.type, cur_dirs.modified, hist.type, hist.event_type, hist.static_found, owners.save)
+		в cur_dirs и deleted нет общих id
 		'''
 
 		# присутствуют таблицы: cur_dirs, cur_stat, deleted, hist, owners
@@ -366,15 +388,7 @@ class filesdb:
 		deleted_ids = {x[0] for x in self.CUR.execute('SELECT id FROM deleted').fetchall()}
 		assert deleted_parents <= (notroot_dirs_ids|deleted_ids), f'lost parents in deleted: {deleted_parents-(notroot_dirs_ids|deleted_ids)}'
 
-		# 	для hist в cur_dirs или deleted
-		hist_parents = {x[0] for x in self.CUR.execute('SELECT parent_id FROM hist WHERE parent_id!=-1').fetchall()}
-		assert hist_parents <= (notroot_dirs_ids|deleted_ids), f'lost parents in hist: {hist_parents-(notroot_dirs_ids|deleted_ids)}'
-
-		# для всех из hist есть образ в cur_stat или deleted
-		hist_ids = {x[0] for x in self.CUR.execute('SELECT id FROM hist').fetchall()}
-		assert hist_ids <= (notroot_dirs_ids|deleted_ids), f'hist enty with unknown id: {hist_ids-(notroot_dirs_ids|deleted_ids)}'
-
-		# для всех из cur_stat, deleted, hist у кого owner is not None есть owner в owners
+		# для всех из cur_stat, deleted у кого owner is not None есть owner в owners
 		stat_owners = {x[0] for x in self.CUR.execute('SELECT owner FROM cur_stat WHERE owner NOT NULL').fetchall()}
 		deleted_owners = {x[0] for x in self.CUR.execute('SELECT owner FROM deleted WHERE owner NOT NULL').fetchall()}
 		owners = {x[0] for x in self.CUR.execute('SELECT id FROM owners').fetchall()}
@@ -385,6 +399,22 @@ class filesdb:
 			assert t1==t2 , (t1,t2)
 			if mode is not None:
 				assert t2==simple_type(mode), (t2,simple_type(mode))
+
+		# в cur_dirs и deleted нет общих id
+		assert deleted_ids&cur_dirs_ids == set(), f'common ids in cur_dirs and deleted: {deleted_ids&cur_dirs_ids}'
+
+		# для всех из hist есть образ в cur_stat или deleted
+		# hist_ids = {x[0] for x in self.CUR.execute('SELECT id FROM hist').fetchall()}
+		# assert hist_ids <= (notroot_dirs_ids|deleted_ids), f'hist enty with unknown id: {hist_ids-(notroot_dirs_ids|deleted_ids)}'
+		# если создать файл, переименовать его и удалить, а потом повторить, то id первого файла затрётся в deleted и больше не будет существовать ни в cur_dirs ни в deleted
+		# при этом на каждое событие в ФС мы не будем осуществлять просмотр hist для удаления старых записей
+		# к тому же в hist присутствует и parent_id и name, так что восстановить расположение объекта в ФС будет не сложно
+
+		# 	для hist в cur_dirs или deleted
+		# hist_parents = {x[0] for x in self.CUR.execute('SELECT parent_id FROM hist WHERE parent_id!=-1').fetchall()}
+		# assert hist_parents <= (notroot_dirs_ids|deleted_ids), f'lost parents in hist: {hist_parents-(notroot_dirs_ids|deleted_ids)}'
+		# целостность hist во время фоновой работы проверять не будем, сделаем потом отдельено check_hist, clean_hist ...
+
 	# --------------
 	# общие функции образа ФС
 	# --------------
@@ -550,7 +580,7 @@ class filesdb:
 	# общие функции событий
 	# ---------------------
 
-	def id2path_hist(self,fid,cursor=None):
+	def id2path_d(self,fid,cursor=None):
 		'''
 		то же что id2path(), только ещё ищет в deleted
 		возвращает (path, deleted: Bool)
@@ -569,7 +599,7 @@ class filesdb:
 			path.insert(0,name)
 		path.insert(0,'')
 		return '/'.join(path), deleted
-	def path2ids_hist(self,path,cursor=None):
+	def path2ids_d(self,path,cursor=None):
 		'''
 		то же что path2ids(), только ещё ищет в deleted
 		возвращает (ids, deleted: Bool)
@@ -602,7 +632,7 @@ class filesdb:
 		if fid is None:
 			fid = os.getcwd()
 		if type(fid) is str: 
-			fid = self.path2ids_hist(normalize_path(os.path.abspath(fid)))[0][-1]
+			fid = self.path2ids_d(normalize_path(os.path.abspath(fid)))[0][-1]
 			if fid is None: raise Exception('path does not exist')
 		return fid
 
@@ -661,7 +691,7 @@ class filesdb:
 						   (fid,typ,etyp,ltime,static_found,fid,fid)
 			)
 		if self.VERBOSE>=1 or owner is None and self.VERBOSE>0:
-			self.notify(0,datetime.fromtimestamp(ltime), etyp2str(etyp), static_found, fid, typ2str(typ), self.id2path_hist(fid,cursor)[0])
+			self.notify(0,datetime.fromtimestamp(ltime), etyp2str(etyp), static_found, fid, typ2str(typ), self.id2path_d(fid,cursor)[0])
 
 	def modify(self, fid, stat, static_found, cursor=None):
 		'''
@@ -799,6 +829,7 @@ class filesdb:
 						cursor.execute('UPDATE cur_dirs SET modified = 0 WHERE id = ?',(fid,))
 						cnt+=1
 						if cnt%1000000==0:
+							print('COMMIT update_hashes')
 							cursor.execute('COMMIT')
 
 		# обновить симлинки, директории, сынтегрировать хеши
@@ -988,7 +1019,7 @@ class filesdb:
 		self.notify(2, 'modified',src_path, stat, is_directory, is_synthetic, cursor)
 		src_path = normalize_path(src_path)
 		if is_synthetic:
-			self.notify(0,'synthetic modified',src_path, is_directory)
+			print('synthetic modified',src_path, is_directory, datetime.fromtimestamp(time()))
 			return
 		ids = self.path2ids(src_path,cursor)
 		if ids[-1] is None:
@@ -1001,7 +1032,7 @@ class filesdb:
 		self.notify(2, 'created',src_path, stat, is_directory, is_synthetic, cursor)
 		src_path = normalize_path(src_path)
 		if is_synthetic:
-			self.notify(0,'synthetic created',src_path, is_directory)
+			print('synthetic created',src_path, is_directory, datetime.fromtimestamp(time()))
 			return
 		ids = self.path2ids(src_path,cursor)
 		if ids[-1] is not None:
@@ -1015,7 +1046,7 @@ class filesdb:
 		self.notify(2, 'deleted',src_path, is_directory, is_synthetic, cursor)
 		src_path = normalize_path(src_path)
 		if is_synthetic:
-			self.notify(0,'synthetic deleted',src_path, is_directory)
+			print('synthetic deleted',src_path, is_directory, datetime.fromtimestamp(time()))
 			return
 		ids = self.path2ids(src_path,cursor)
 		if ids[-1] is None:
@@ -1029,7 +1060,7 @@ class filesdb:
 		src_path = normalize_path(src_path)
 		dest_path = normalize_path(dest_path)
 		if is_synthetic:
-			self.notify(0,'synthetic moved',src_path, dest_path, is_directory)
+			print('synthetic moved',src_path, dest_path, is_directory, datetime.fromtimestamp(time()))
 			return
 		ids = self.path2ids(src_path,cursor)
 		if ids[-1] is None:
@@ -1156,17 +1187,18 @@ class filesdb:
 
 				def my_walk(did):
 					#self.notify(0,'my_walk',did)
-					if replace_inner:
-						n = cursor.execute('SELECT name,id,type FROM cur_dirs WHERE parent_id = ? ',(did,)).fetchall()
-					elif oldoid is None:
-						n = cursor.execute('''SELECT cur_dirs.name, cur_dirs.id, cur_dirs.type FROM cur_dirs JOIN cur_stat ON cur_dirs.id=cur_stat.id
-							WHERE cur_dirs.parent_id = ? AND cur_stat.owner ISNULL''',(did,)).fetchall()
-					else:
-						n = cursor.execute('''SELECT cur_dirs.name, cur_dirs.id, cur_dirs.type FROM cur_dirs JOIN cur_stat ON cur_dirs.id=cur_stat.id
-							WHERE cur_dirs.parent_id = ? AND cur_stat.owner = ?''',(did,oldoid)).fetchall()
-					for name,fid,ftype in n:
-						cursor.execute('UPDATE cur_stat SET owner = ? WHERE id = ?',(oid,fid))
-						my_walk(fid)
+					if True:
+						if replace_inner:
+							n = cursor.execute('SELECT name,id,type FROM cur_dirs WHERE parent_id = ? ',(did,)).fetchall()
+						elif oldoid is None:
+							n = cursor.execute('''SELECT cur_dirs.name, cur_dirs.id, cur_dirs.type FROM cur_dirs JOIN cur_stat ON cur_dirs.id=cur_stat.id
+								WHERE cur_dirs.parent_id = ? AND cur_stat.owner ISNULL''',(did,)).fetchall()
+						else:
+							n = cursor.execute('''SELECT cur_dirs.name, cur_dirs.id, cur_dirs.type FROM cur_dirs JOIN cur_stat ON cur_dirs.id=cur_stat.id
+								WHERE cur_dirs.parent_id = ? AND cur_stat.owner = ?''',(did,oldoid)).fetchall()
+						for name,fid,ftype in n:
+							cursor.execute('UPDATE cur_stat SET owner = ? WHERE id = ?',(oid,fid))
+							my_walk(fid)
 					if in_deleted:
 						if replace_inner:
 							n = cursor.execute('SELECT name,id FROM deleted WHERE parent_id = ? ',(did,)).fetchall()
@@ -1349,22 +1381,24 @@ class filesdb:
 				elif type(event) is str:
 					if event=='q':
 						if self.CON.in_transaction:
+							print('COMMIT event=="q"')
 							self.CUR.execute('COMMIT')
 							stopped = True
 						break
 					elif event=='u':
 						if self.CON.in_transaction:
+							print('COMMIT event=="u"')
 							self.CUR.execute('COMMIT')
-							self.notify(1.2, 'COMMIT',datetime.fromtimestamp(time()))
 							self.check_integrity()
 					else:
 						import yaml
 						try:
 							event = yaml.safe_load('['+event+']')
-						except ParserError as e:
+						except yaml.YAMLError as e:
 							print(e)
 						else:
 							if self.CON.in_transaction:
+								print('COMMIT before command')
 								self.CUR.execute('COMMIT')
 							try:
 								if len(event)==2: event.append({})
@@ -1375,6 +1409,7 @@ class filesdb:
 							except Exception as e:
 								self.raise_notify(e,'type: "help, []" for more information about syntax')
 							if self.CON.in_transaction:
+								print('COMMIT after command')
 								self.CUR.execute('COMMIT')
 				else:
 					self.notify(0,'unknown type:',type(event))
@@ -1454,8 +1489,8 @@ class filesdb:
 			(parent_id,name,fid,oid) = n
 			deleted = True
 			modified = 0
-			path = self.id2path_hist(fid)[0]
-			ids = self.path2ids_hist(path)[0]
+			path = self.id2path_d(fid)[0]
+			ids = self.path2ids_d(path)[0]
 
 			n = self.CUR.execute('''SELECT data, 
 				st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,
@@ -1692,7 +1727,7 @@ class filesdb:
 			return
 		path = os.path.abspath(path)
 		# format: save owner fid deleted path
-		(fid,deleted) = self.path2ids_hist(path,self.CUR)
+		(fid,deleted) = self.path2ids_d(path,self.CUR)
 		fid = fid[-1]
 		if fid is None:
 			self.raise_notify(None, 'path does not exist')
@@ -1714,7 +1749,7 @@ class filesdb:
 
 	def unused_owners(self):
 		for (oid, oname) in self.CUR.execute('''SELECT owners.id, owners.name  FROM owners WHERE owners.id NOT IN 
-				(SELECT cur_stat.owner AS id FROM cur_stat WHERE cur_stat.owner NOT NULL UNION SELECT deleted.owner AS id FROM deleted WHERE deleted.owner NOT NULL)'''):
+				(SELECT cur_stat.owner AS id FROM cur_stat WHERE cur_stat.owner NOT NULL /*UNION SELECT deleted.owner AS id FROM deleted WHERE deleted.owner NOT NULL*/)'''):
 			print(oid, oname, sep='\t')
 
 	def all_info(self, interval=None, show_deleted=True):
@@ -1730,7 +1765,7 @@ class filesdb:
 		self.unused_owners()
 
 	def hist_id(self, fid):
-		print(self.id2path_hist(fid,self.CUR))
+		print(self.id2path_d(fid,self.CUR))
 		with closing(self.CON.execute('SELECT * FROM cur_dirs WHERE id = ?',(fid,))) as cursor:
 			list(self.print_fid(cursor))
 		for (parent_id, name, typ, etyp, data, time, static_found) in \
@@ -1742,7 +1777,7 @@ class filesdb:
 				else: assert False, etyp
 				if etyp=='V':
 					print(etyp+' '+('S' if static_found else 'W')+' '+str(datetime.fromtimestamp(time)),
-						 self.id2path_hist(parent_id,self.CUR)[0]+'/'+name)
+						 self.id2path_d(parent_id,self.CUR)[0]+'/'+name)
 				else:
 					print(etyp+' '+('S' if static_found else 'W')+' '+str(datetime.fromtimestamp(time)))
 

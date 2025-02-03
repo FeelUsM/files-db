@@ -19,23 +19,23 @@ def start(path):
     observer.schedule(event_handler, path, recursive=True)
     observer.start()
 
-#start('/boot')
-#start('/root')
+start('/boot')
+start('/root')
 start('/home')
 
-#start('/snap')
+start('/snap')
 
-#start('/bin.usr-is-merged')
-#start('/sbin.usr-is-merged')
-#start('/lib.usr-is-merged')
-#start('/usr')
-#start('/etc')
+start('/bin.usr-is-merged')
+start('/sbin.usr-is-merged')
+start('/lib.usr-is-merged')
+start('/usr')
+start('/etc')
 
-#start('/opt')
-#start('/srv')
+start('/opt')
+start('/srv')
 
-#start('/var')
-#start('/tmp')
+start('/var')
+start('/tmp')
 
 #start('/lost+found')
 
