@@ -574,7 +574,7 @@ class filesdb:
 		self._create_tables()
 		self._init_cur(self.ROOT_DIRS)
 		if not nohash:
-			self.update_hashes(True,None)
+			self.update_hashes(True)
 
 	# ---------------------
 	# общие функции событий
@@ -798,10 +798,8 @@ class filesdb:
 	# функции статического обновления
 	# --------------------------------
 
-	def update_hashes(self, with_all=False, modify='self.modify'):
+	def update_hashes(self, with_all=False):
 		# todo calc only unknown hashes
-		if modify == 'self.modify': modify = self.modify
-
 		with self.CON:
 			with closing(self.CON.cursor()) as cursor:
 				if with_all:
@@ -821,10 +819,9 @@ class filesdb:
 					except Exception as e:
 						self.raise_notify(e,fid,path)
 					else:
-						if modify is not None:
-							(ohash,) = cursor.execute('SELECT data FROM cur_stat WHERE id = ?',(fid,)).fetchone()
-							if ohash is not None and ohash!=hsh:
-								modify(fid, os_stat(path), 2, cursor)
+						(ohash,) = cursor.execute('SELECT data FROM cur_stat WHERE id = ?',(fid,)).fetchone()
+						if ohash is not None and ohash!=hsh:
+							self.modify(fid, os_stat(path), 2, cursor)
 						cursor.execute('UPDATE cur_stat SET data = ? WHERE id = ?',(hsh,fid))
 						cursor.execute('UPDATE cur_dirs SET modified = 0 WHERE id = ?',(fid,))
 						cnt+=1
@@ -848,10 +845,9 @@ class filesdb:
 						elif ftype==MLINK:
 							try:
 								lnk = os.readlink(self.id2path(fid,cursor))
-								if modify is not None:
-									(olink,) = cursor.execute('SELECT data FROM cur_stat WHERE id = ?',(fid,)).fetchone()
-									if olink is not None and olink!=lnk:
-										modify(fid, os_stat(self.id2path(fid)), 2, cursor)
+								(olink,) = cursor.execute('SELECT data FROM cur_stat WHERE id = ?',(fid,)).fetchone()
+								if olink is not None and olink!=lnk:
+									self.modify(fid, os_stat(self.id2path(fid)), 2, cursor)
 								lhsh = hashlib.md5(lnk.encode()).hexdigest()
 								cursor.execute('UPDATE cur_stat SET data = ? WHERE id = ?',(lnk,fid))
 								cursor.execute('UPDATE cur_dirs SET modified = 0 WHERE id = ?',(fid,))
