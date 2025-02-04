@@ -477,8 +477,6 @@ class filesdb:
 		по fid-у заполняет stat-поля в cur_stat
 		'''
 		if cursor is None: cursor = self.CUR
-		(typ,) = cursor.execute('SELECT type FROM cur_stat WHERE id = ?',(fid,)).fetchone()
-		assert typ == simple_type(stat.st_mode), (fid,typ, simple_type(stat.st_mode), stat.st_mode)
 		cursor.execute('''UPDATE cur_stat SET
 			st_mode=?,st_ino=?,st_dev=?,st_nlink=?,st_uid=?,st_gid=?,st_size=?,
 			st_atime=?,st_mtime=?,st_ctime=?,st_blocks=?,st_blksize=? WHERE id = ?''',
@@ -699,6 +697,15 @@ class filesdb:
 		'''
 		if cursor is None: cursor = self.CUR
 
+		(typ,) = cursor.execute('SELECT type FROM cur_stat WHERE id = ?',(fid,)).fetchone()
+		if typ != simple_type(stat.st_mode):
+			self.notify(0.5, f'changed type of {fid} {self.id2path(fid,cursor)}')
+			parent_id, name = cursor.execute('SELECT parent_id, name FROM cur_dirs WHERE id = ?',(fid,)).fetchone()
+			owner, save = self.owner_save(fid,cursor)
+			self.delete(fid, static_found, cursor)
+			self.create(parent_id, name, stat, static_found, cursor, owner, save)
+			return
+
 		self.set_modified(fid, cursor)
 		self.update_stat(fid,stat,cursor)
 
@@ -722,7 +729,7 @@ class filesdb:
 	def create(self, parent_id, name, stat, static_found, cursor=None, owner=None, save=None):
 		'''
 		создается объект, родительская директория которого уже существует
-		save, owner определяются родительской папкой или 
+		save, owner определяются родительской папкой или из таблицы deleted
 		возвращает fid созданного объекта
 		'''
 		if cursor is None: cursor = self.CUR
