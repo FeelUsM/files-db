@@ -1731,8 +1731,6 @@ class filesdb:
 		fid = fid[-1]
 		if fid is None:
 			self.raise_notify(None, 'path does not exist')
-		if show_deleted or not deleted:
-			print(*self.format_info(self.info_fid(fid), info_lev=0, abs_path=True),sep='\t')
 		def my_walk(did,deleted,downer,depth):
 			if not deleted:
 				for (owner, fid) in self.CUR.execute(
@@ -1745,7 +1743,10 @@ class filesdb:
 					if owner!=downer:
 						print(*self.format_info(self.info_fid(fid), info_lev=0, abs_path=True),sep='\t')
 					my_walk(fid,True,owner,depth+1)
-		my_walk(fid,deleted,owner,0)
+		if show_deleted or not deleted:
+			info = self.info_fid(fid)
+			print(*self.format_info(info, info_lev=0, abs_path=True),sep='\t')
+			my_walk(fid,deleted,info.oid,0)
 
 	def unused_owners(self):
 		for (oid, oname) in self.CUR.execute('''SELECT owners.id, owners.name  FROM owners WHERE owners.id NOT IN 
