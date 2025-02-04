@@ -7,7 +7,10 @@ from time import time, sleep
 from datetime import datetime
 from contextlib import closing
 from traceback import print_exception, extract_stack, extract_tb, format_list
+import inspect
 import subprocess
+import yaml
+import socket
 
 class AttrDict(dict):
 	def __getattr__(self, key):
@@ -689,7 +692,7 @@ class filesdb:
 						   (fid,typ,etyp,ltime,static_found,fid,fid)
 			)
 		if self.VERBOSE>=1 or owner is None and self.VERBOSE>0:
-			self.notify(0,datetime.fromtimestamp(ltime), etyp2str(etyp), static_found, fid, typ2str(typ), self.id2path_d(fid,cursor)[0])
+			self.notify(0,datetime.fromtimestamp(ltime), etyp2str(etyp), fid, typ2str(typ), self.id2path_d(fid,cursor)[0])
 
 	def modify(self, fid, stat, static_found, cursor=None):
 		'''
@@ -1074,10 +1077,22 @@ class filesdb:
 	# --------------------------------
 	# интерфейсные функции
 	# --------------------------------
+	def send2server(self, name,*args,**kwargs):
+		if len(name)==1:
+			message = name+'\n'
+		else:
+			mesage = yaml.dump([name,list(args),kwargs], default_flow_style=True, sort_keys=False)[1:-2]+'\n'
+		if type(self.server_in) is socket.socket:
+			self.server_in.sendall(mesage.encode())
+		else:
+			print(message, file=self.server_in, end='')
+			self.server_in.flush()
+
 	def reset_modified(self):
 		'''
 		сбрасывает все modified флаги
 		'''
+		if self.server_in is not None: return self.send2server(inspect.stack()[0][3])
 		with self.CON:
 			self.CUR.execute('UPDATE cur_dirs SET modified =0 WHERE modified==1')
 
@@ -1085,6 +1100,9 @@ class filesdb:
 		'''
 		создает владельца, возвращает его id
 		'''
+		if self.server_in is not None: 
+			self.send2server(inspect.stack()[0][3], name, save)
+			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 		with self.CON:
 			self.CUR.execute('INSERT INTO owners (name, save) VALUES (?, ?)', (name,save))
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
@@ -1093,6 +1111,9 @@ class filesdb:
 		'''
 		у существующего владельца обновляет параметр save, возвращает его id
 		'''
+		if self.server_in is not None: 
+			self.send2server(inspect.stack()[0][3], name, save)
+			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 		with self.CON:
 			self.CUR.execute('UPDATE owners SET save = ? WHERE name = ?', (save,name))
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
@@ -1101,6 +1122,9 @@ class filesdb:
 		'''
 		создаёт владельца, а если он уже существует, то только обновляет его параметр save. Возвращает его id
 		'''
+		if self.server_in is not None: 
+			self.send2server(inspect.stack()[0][3], name, save)
+			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 		with self.CON:
 			self.CUR.execute('''INSERT INTO owners (name, save) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET
 				name = excluded.name,    save = excluded.save ''', (name,save))
@@ -1110,6 +1134,7 @@ class filesdb:
 		'''
 		удаляет владельца и все упоминания о нём из таблиц cur_stat, deleted
 		'''
+		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], owner)
 		with self.CON:
 			self.CUR.execute('UPDATE cur_stat SET owner = NULL WHERE cur_stat.owner = (SELECT owners.id FROM owners WHERE owners.name = ?)',(owner,))
 			self.CUR.execute('UPDATE deleted  SET owner  = NULL WHERE deleted.owner  = (SELECT owners.id FROM owners WHERE owners.name = ?)',(owner,))
@@ -1120,6 +1145,7 @@ class filesdb:
 		удаляет владельца и все упоминания о нём из таблиц cur_stat, deleted
 		а также удалает из hist все записи, в которых упоминается этот владелец
 		'''
+		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], owner)
 		with self.CON:
 			self.CUR.execute('DELETE FROM hist WHERE hist.id IN (SELECT cur_stat.id FROM cur_stat JOIN owners ON cur_stat.owner=owners.id WHERE owners.name = ?)',(owner,))
 			self.CUR.execute('DELETE FROM hist WHERE hist.id IN (SELECT deleted.id FROM deleted JOIN owners ON deleted.owner=owners.id WHERE owners.name = ?)',(owner,))
@@ -1132,6 +1158,7 @@ class filesdb:
 		удалает из hist все записи, в которых упоминается этот владелец
 		'''
 		#todo interval
+		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], owner, interval=interval)
 		with self.CON:
 			self.CUR.execute('DELETE FROM hist WHERE hist.id IN (SELECT cur_stat.id FROM cur_stat JOIN owners ON cur_stat.owner=owners.id WHERE owners.name = ?)',(owner,))
 			self.CUR.execute('DELETE FROM hist WHERE hist.id IN (SELECT deleted.id FROM deleted JOIN owners ON deleted.owner=owners.id WHERE owners.name = ?)',(owner,))
@@ -1141,6 +1168,7 @@ class filesdb:
 		удаляет из истории все записи про заданный объект
 		'''
 		#todo interval
+		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], fid, interval=interval)
 		fid = any2id_hist(fid)
 		with self.CON:
 			self.CUR.execute('DELETE FROM hist WHERE id = ?)',(fid,))
@@ -1150,6 +1178,7 @@ class filesdb:
 		удаляет из истории все записи про заданный объект и его дочерние объекты
 		'''
 		#todo interval
+		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], fid, interval=interval)
 		fid = any2id_hist(fid)
 		with self.CON:
 			self.CUR.execute('DELETE FROM hist WHERE id = ?)',(fid,))
@@ -1163,6 +1192,7 @@ class filesdb:
 				fids = fids2
 
 	def rename_owner(self, oname, name):
+		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], oname, name)
 		with self.CON:
 			self.CUR.execute('UPDATE owners SET name = ? WHERE name = ?',(name,oname))
 
@@ -1176,6 +1206,7 @@ class filesdb:
 			если False - только для тех вложенных, у которых еще нет owner-а или он такой как у объекта path
 		in_deleted - устанавливать ли owner-а для удалённых объектов
 		'''
+		if self.server_in is not None: self.send2server(inspect.stack()[0][3], path, owner, replace_inner=replace_inner, in_deleted=in_deleted); return self.any2id_hist(path)
 		with self.CON:
 			with closing(self.CON.cursor()) as cursor:
 				# oid - owner-id, который будем устанавливать
@@ -1218,17 +1249,19 @@ class filesdb:
 				return fid
 
 	def set_create_owner(self, path, owner, save, *, del_hist=False, replace_inner=False, in_deleted=True):
+		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], path, owner, save, del_hist=del_hist, replace_inner=replace_inner, in_deleted=in_deleted)
 		self.create_owner(owner, save)
 		self.set_owner(path, owner, replace_inner=replace_inner, in_deleted=in_deleted)
 		if del_hist: self.del_hist_owner(owner)
 
 	def set_credate_owner(self, path, owner, save, *, del_hist=False, replace_inner=False, in_deleted=True):
+		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], path, owner, save, del_hist=del_hist, replace_inner=replace_inner, in_deleted=in_deleted)
 		self.credate_owner(owner, save)
 		self.set_owner(path, owner, replace_inner=replace_inner, in_deleted=in_deleted)
 		if del_hist: self.del_hist_owner(owner)
 
-	@staticmethod
-	def help():
+	def help(self):
+		if self.server_in is not None: return self.send2server(inspect.stack()[0][3])
 		print('''
 		syntax: yaml list of
 			fun_name, args
@@ -1241,7 +1274,7 @@ class filesdb:
 		set_VERBOSE(x)
 		get_VERBOSE()
 		check_integrity()
-		update_hashes(with_all=False, modify=None)
+		update_hashes(with_all=False)
 
 		create_owner(name, save)
 		update_owner(name, save)
@@ -1382,6 +1415,8 @@ class filesdb:
 				if isinstance(event,FileSystemEvent):
 					my_event_handler(event)
 				elif type(event) is str:
+					if event=='':
+						pass
 					if event=='q':
 						if self.CON.in_transaction:
 							print('COMMIT event=="q"')
@@ -1394,11 +1429,12 @@ class filesdb:
 							self.CUR.execute('COMMIT')
 							self.check_integrity()
 					else:
-						import yaml
 						try:
+							eventmes = event
 							event = yaml.safe_load('['+event+']')
 						except yaml.YAMLError as e:
 							print(e)
+							print('got: ', repr(eventmes))
 						else:
 							if self.CON.in_transaction:
 								print('COMMIT before command')
@@ -1411,6 +1447,7 @@ class filesdb:
 								print('-----------------------')
 							except Exception as e:
 								self.raise_notify(e,'type: "help, []" for more information about syntax')
+								print('got: ', repr(eventmes))
 							if self.CON.in_transaction:
 								print('COMMIT after command')
 								self.CUR.execute('COMMIT')
@@ -1432,6 +1469,8 @@ class filesdb:
 		finally:
 			observer.stop()  # Останавливаем Observer
 			observer.join()  # Ждем завершения потока
+			self.notify(0,'watcher stopped')
+
 
 	# --------------------------------
 	# мониторинговые функции
@@ -1815,7 +1854,8 @@ class filesdb:
 				dirs.append('/'+rd)
 		return dirs
 
-	def __init__(self, files_db, root_dirs = None, nohash = False, ro = True, nocheck=False):
+	def __init__(self, files_db, root_dirs = None, nohash = False, nocheck=False, server_in=None):
+		print('hello')
 		'''инициализирует FILES_DB, ROOT_DIRS; открывает сединение CON, CUR (по умолчанию только для чтения)'''
 		try:
 			self.CON.cursor().close()
@@ -1824,6 +1864,15 @@ class filesdb:
 		else:
 			self.CON.close()
 			#raise Exception('close existing connection before opening new one')
+
+		ro = server_in is not None
+		self.server_in = None
+		if server_in is not None:
+			if STAT.S_ISSOCK(os.stat(server_in).st_mode):
+				self.server_in = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+				self.server_in.connect(server_in)
+			else:
+				self.server_in = open(server_in, "w")
 
 		if root_dirs is None:
 			# loading existring db
@@ -1837,7 +1886,6 @@ class filesdb:
 				db_mode = self.CON.execute("PRAGMA journal_mode=WAL;").fetchone()
 				assert db_mode==('wal',), db_mode
 			self.CUR = self.CON.cursor()
-
 
 			if not nocheck:
 				self.check_integrity()
@@ -1864,6 +1912,8 @@ class filesdb:
 
 	def __del__(self):
 		self.CON.close()
+		if self.server_in is not None:
+			self.server_in.close()
 		if self.keyboard_thr is not None and self.keyboard_thr.is_alive():
 			self.notify(1.5,f'filesdb({repr(self.FILES_DB)}): lost running keyboard thread')
 		if self.commit_thr is not None and self.commit_thr.is_alive():
@@ -1890,5 +1940,5 @@ if __name__ == "__main__":
 	root_dirs = sys.argv[2:]
 	if len(root_dirs)==0: root_dirs = None
 	print(sys.argv[1],root_dirs,nohash)
-	fdb = filesdb(sys.argv[1],root_dirs,nohash, ro=False)
+	fdb = filesdb(sys.argv[1],root_dirs,nohash)
 	fdb.watch()
