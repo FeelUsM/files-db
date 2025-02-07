@@ -1037,11 +1037,11 @@ class filesdb:
 		self.create(fid, name, stat, False, cursor, owner, save)
 
 	def move_deleted(self, ofid, nfid, cursor=None):
-		if cursor is None: cursor = self.CUR
 		'''
 		в deleted у потомков ofid меняет предка на nfid
 		а если происходит коллизия по имени с dirs - удаляет его и применяется рекурсивно
 		'''
+		if cursor is None: cursor = self.CUR
 		forbidden_names = set(cursor.execute('SELECT name FROM dirs WHERE parent_id = ?',(nfid,)).fetchall())
 		for (name,fid) in cursor.execute('SELECT name, id FROM deleted WHERE parent_id = ?',(ofid,)).fetchall():
 			if (name,) in forbidden_names:
@@ -1135,9 +1135,9 @@ class filesdb:
 		if len(name)==1:
 			message = name+'\n'
 		else:
-			mesage = yaml.dump([name,list(args),kwargs], default_flow_style=True, sort_keys=False)[1:-2]+'\n'
+			message = yaml.dump([name,list(args),kwargs], default_flow_style=True, sort_keys=False).replace('\n','')[1:-1]+'\n'
 		if type(self.server_in) is socket.socket:
-			self.server_in.sendall(mesage.encode())
+			self.server_in.sendall(message.encode())
 		else:
 			print(message, file=self.server_in, end='')
 			self.server_in.flush()
@@ -1485,13 +1485,13 @@ class filesdb:
 					else:
 						try:
 							eventmes = event
+							print('got: ', repr(eventmes))
 							event = yaml.safe_load('['+event+']')
 						except yaml.YAMLError as e:
 							print(e)
-							print('got: ', repr(eventmes))
 						else:
 							if self.CON.in_transaction:
-								print('COMMIT before command')
+								#print('COMMIT before command')
 								self.CUR.execute('COMMIT')
 							try:
 								if len(event)==2: event.append({})
@@ -1816,6 +1816,7 @@ class filesdb:
 		# todo если задан owner - показывает только его
 		# выводить только если owner и owner родителя не совпадают
 		# deleted - с пометками
+		count = 0
 		if path is None:
 			for dr in self.ROOT_DIRS:
 				self.list_owners(dr, show_deleted)
@@ -1827,21 +1828,26 @@ class filesdb:
 		if fid is None:
 			self.raise_notify(None, 'path does not exist')
 		def my_walk(did,deleted,downer,depth):
+			nonlocal count
 			if not deleted:
 				for (owner, fid) in self.CUR.execute(
 					'SELECT stat.owner, stat.id FROM stat JOIN dirs ON dirs.id=stat.id WHERE dirs.parent_id = ?',(did,)).fetchall():
 					if owner!=downer:
+						count+=1
 						print(*self.format_info(self.info_fid(fid), info_lev=0, abs_path=True),sep='\t')
 					my_walk(fid,False,owner,depth+1)
 			if show_deleted:
 				for (owner, fid) in self.CUR.execute('SELECT owner, id FROM deleted WHERE parent_id = ?''',(did,)).fetchall():
 					if owner!=downer:
+						count+=1
 						print(*self.format_info(self.info_fid(fid), info_lev=0, abs_path=True),sep='\t')
 					my_walk(fid,True,owner,depth+1)
 		if show_deleted or not deleted:
 			info = self.info_fid(fid)
+			count+=1
 			print(*self.format_info(info, info_lev=0, abs_path=True),sep='\t')
 			my_walk(fid,deleted,info.oid,0)
+		print('total objects number:',count)
 
 	def unused_owners(self):
 		for (oid, oname) in self.CUR.execute('''SELECT owners.id, owners.name  FROM owners WHERE owners.id NOT IN 
@@ -1908,7 +1914,6 @@ class filesdb:
 		return dirs
 
 	def __init__(self, files_db, root_dirs = None, nohash = False, nocheck=False, server_in=None):
-		print('hello')
 		'''инициализирует FILES_DB, ROOT_DIRS; открывает сединение CON, CUR (по умолчанию только для чтения)'''
 		try:
 			self.CON.cursor().close()
@@ -1933,14 +1938,16 @@ class filesdb:
 				raise Exception(f'database {files_db} does not exist. Create it with root_dirs argument')
 			self.FILES_DB = files_db
 			if ro:
+				print(f'connect in readonly mode to {self.FILES_DB}')
 				self.CON = sqlite3.connect('file:'+self.FILES_DB+'?mode=ro', uri=True)
 			else:
+				print(f'connect in readwrite mode to {self.FILES_DB}')
 				self.CON = sqlite3.connect(self.FILES_DB)
 				db_mode = self.CON.execute("PRAGMA journal_mode=WAL;").fetchone()
 				assert db_mode==('wal',), db_mode
 			self.CUR = self.CON.cursor()
 
-			if not nocheck:
+			if not nocheck and not ro:
 				self.check_integrity()
 			self.ROOT_DIRS = self.read_root_dirs()
 		else:
@@ -1957,7 +1964,7 @@ class filesdb:
 			self.CUR = self.CON.cursor()
 			self.ROOT_DIRS = root_dirs
 			self.init_db(nohash)
-			if not nocheck:
+			if not nocheck and not ro:
 				self.check_integrity()
 			if ro:
 				self.CON.close()
