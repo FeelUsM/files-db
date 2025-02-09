@@ -29,6 +29,39 @@ class NullContextManager(object):
     def __exit__(self, *args):
         pass
 
+
+assert len(os.sep)==1
+def internal_path(path):
+	'''
+	преобразует путь из представления, понятного ОС во внутреннее представление:
+	элементы пути отделяются ровно одним os.sep
+	путь начинается с os.sep
+	в конце пути os.sep отсутствует
+	'''
+	#if path is None:
+	#	path = os.getcwd()
+	#path = os.path.abspath(path)
+	assert os.path.isabs(path)
+	path = path.replace(os.sep+os.sep,os.sep).replace(os.sep+os.sep,os.sep).replace(os.sep+os.sep,os.sep).replace(os.sep+os.sep,os.sep)
+	if path[-1]==os.sep:
+		path = path[:-1]
+	if os.name=='nt':
+		path = os.sep+path
+	return path
+def external_path(path):
+	'''
+	повторное применеие этой функции допустимо
+	'''
+	if os.name=='nt':
+		if path.count(os.sep)==1 and path[0]==os.sep:
+			path+=os.sep
+		if path[0]==os.sep:
+			path = path[1:]
+	return path
+def normalize_path(path):
+	if path is None: path = os.getcwd()
+	return internal_path(os.path.abspath(path))
+
 # dirs:modified
 # 2 - pre-root-dir
 # 1 - modified
@@ -46,7 +79,8 @@ MLINK = 2
 MOTHER = 3 # встречаются всякие сокеты, именованные каналы. Не смотря на то, что в /sys, /dev, /proc, /run - не лезем
 
 def os_stat(path,follow_symlinks=False):
-	return os.stat(path,follow_symlinks=follow_symlinks)
+	return os.stat(external_path(path),follow_symlinks=follow_symlinks)
+
 def typ2str(x):
 	assert 0<=x<=3
 	return '-' if x==MFILE else \
@@ -119,29 +153,32 @@ def stat_eq(stat, ostat):
 	if simple_type(stat.st_mode)!=MDIR and stat.st_mtime != ostat.st_mtime:
 		#if VERBOSE>=2: print('st_mtime')
 		return False
-	if stat.st_blocks != ostat.st_blocks:
+	if os.name!='nt' and stat.st_blocks != ostat.st_blocks:
 		#if VERBOSE>=2: print('st_blocks')
 		return False
-	if stat.st_blksize != ostat.st_blksize:
+	if os.name!='nt' and stat.st_blksize != ostat.st_blksize:
 		#if VERBOSE>=2: print('st_blksize')
 		return False
 	return True
 
-def normalize_path(path):
-	return path.replace('//','/').replace('//','/').replace('//','/').replace('//','/')
-
-import pwd
 def get_username_by_uid(uid):
-	try:
-		return pwd.getpwuid(uid).pw_name
-	except KeyError:
-		return None  # Если UID не существует
-import grp
+	if os.name == 'nt':
+		return 'dummy'
+	else:
+		import pwd
+		try:
+			return pwd.getpwuid(uid).pw_name
+		except KeyError:
+			return None  # Если UID не существует
 def get_groupname_by_gid(gid):
-	try:
-		return grp.getgrgid(gid).gr_name
-	except KeyError:
-		return None  # Если UID не существует
+	if os.name == 'nt':
+		return 'dummy'
+	else:
+		import grp
+		try:
+			return grp.getgrgid(gid).gr_name
+		except KeyError:
+			return None  # Если UID не существует
 def access2str(st_mode):
 	mode = STAT.S_IMODE(st_mode)
 	assert mode < 2**11, mode
@@ -177,24 +214,37 @@ class filesdb:
 				self.last_notification = time()
 				sep = kwargs['sep'] if 'sep' in kwargs else ' '
 				message = sep.join(str(x) for x in args)
-				if os.getuid()==0:
-					try:
-						username = 'feelus'
-						title = 'filesdb:'
-						# Получаем DBUS_SESSION_BUS_ADDRESS
-						dbus_address = subprocess.check_output(
-							f"grep -z DBUS_SESSION_BUS_ADDRESS /proc/$(pgrep -u {username} gnome-session | head -n1)/environ | tr '\\0' '\\n' | sed 's/DBUS_SESSION_BUS_ADDRESS=//'",
-							shell=True, text=True
-						).strip()
-						# Отправляем уведомление через sudo
-						subprocess.run(
-							["sudo", "-u", username, f"DBUS_SESSION_BUS_ADDRESS={dbus_address}", "notify-send", title, message],
-							check=True
-						)
-					except subprocess.CalledProcessError as e:
-						print(f"Ошибка при отправке уведомления: {e}")
+				if os.name=='nt':
+					import plyer
+					from plyer import notification
+					notification.notify(
+						title='filesdb',
+						message=message,
+						app_name='filesdb',
+						#app_icon='path/to/the/icon.{}'.format(
+						# On Windows, app_icon has to be a path to a file in .ICO format.
+						#'ico' if platform == 'win' else 'png'
+						#)
+					)
 				else:
-					os.system('notify-send filesdb: "'+message+'"')
+					if os.getuid()==0:
+						try:
+							username = 'feelus'
+							title = 'filesdb:'
+							# Получаем DBUS_SESSION_BUS_ADDRESS
+							dbus_address = subprocess.check_output(
+								f"grep -z DBUS_SESSION_BUS_ADDRESS /proc/$(pgrep -u {username} gnome-session | head -n1)/environ | tr '\\0' '\\n' | sed 's/DBUS_SESSION_BUS_ADDRESS=//'",
+								shell=True, text=True
+							).strip()
+							# Отправляем уведомление через sudo
+							subprocess.run(
+								["sudo", "-u", username, f"DBUS_SESSION_BUS_ADDRESS={dbus_address}", "notify-send", title, message],
+								check=True
+							)
+						except subprocess.CalledProcessError as e:
+							print(f"Ошибка при отправке уведомления: {e}")
+					else:
+						os.system('notify-send filesdb: "'+message+'"')
 
 	def raise_notify(self,e,*args):
 		'''
@@ -419,7 +469,7 @@ class filesdb:
 		n = self.CUR.execute('SELECT dirs.id, dirs.type, stat.type FROM dirs JOIN stat ON dirs.id=stat.id WHERE dirs.type != stat.type').fetchall()
 		assert len(n)==0, f'mismatch types: {n}'
 
-		assert STAT.S_IFMT(0o7777777)==0o170000, hex(STAT.S_IFMT(0o7777777))
+		assert STAT.S_IFMT(0o177777)==0o170000, hex(STAT.S_IFMT(0o177777))
 		# dirs.type  stat.type = simple_type(stat.st_mode)
 		n = self.CUR.execute('''SELECT id, type, st_mode FROM stat WHERE 
 			st_mode&0xf000==? AND type!=? OR
@@ -457,14 +507,14 @@ class filesdb:
 
 	def path2ids(self,path,cursor=None):
 		'''
-		преобразовывает путь в последовательность id-ов всех родительских папок
+		преобразовывает путь(внутренний) в последовательность id-ов всех родительских папок
 		Если в какой-то момент не удалось найти очередную папку - последовательность будет заканчиваться Nane-ом
 		id объекта, задаваемого путём находится в последнй ячейке массива
 		'''
 		if cursor is None: cursor = self.CUR
 		ids = []
 		cur_id = 0
-		for name in path.split('/'):
+		for name in path.split(os.sep):
 			if name=='': continue
 			n = cursor.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(cur_id,name)).fetchone()
 			if n is None:
@@ -475,14 +525,14 @@ class filesdb:
 		return ids
 	def id2path(self,fid,cursor=None):
 		'''
-		преобразовывает id в путь
+		преобразовывает id в путь(внутренний)
 		'''
 		if cursor is None: cursor = self.CUR
 		path = ''
 		while fid!=0:
 			n = cursor.execute('SELECT parent_id, name FROM dirs WHERE id = ? ',(fid,)).fetchone()
 			assert n is not None
-			path = '/'+n[1]+path
+			path = os.sep+n[1]+path
 			fid = n[0]
 		return path
 
@@ -513,12 +563,20 @@ class filesdb:
 		по fid-у заполняет stat-поля в stat
 		'''
 		if cursor is None: cursor = self.CUR
-		cursor.execute('''UPDATE stat SET
-			st_mode=?,st_ino=?,st_dev=?,st_nlink=?,st_uid=?,st_gid=?,st_size=?,
-			st_atime=?,st_mtime=?,st_ctime=?,st_blocks=?,st_blksize=? WHERE id = ?''',
-			(stat.st_mode,stat.st_ino,stat.st_dev,stat.st_nlink,stat.st_uid,stat.st_gid,stat.st_size,
-			stat.st_atime,stat.st_mtime,stat.st_ctime,stat.st_blocks,stat.st_blksize, fid)
-		)
+		if os.name=='nt':
+			cursor.execute('''UPDATE stat SET
+				st_mode=?,st_ino=?,st_dev=?,st_nlink=?,st_uid=?,st_gid=?,st_size=?,
+				st_atime=?,st_mtime=?,st_ctime=? WHERE id = ?''',
+				(stat.st_mode,stat.st_ino,stat.st_dev - (2**64 if stat.st_dev >= 2**63 else 0),stat.st_nlink,stat.st_uid,stat.st_gid,stat.st_size,
+				stat.st_atime,stat.st_mtime,stat.st_ctime, fid)
+			)
+		else:
+			cursor.execute('''UPDATE stat SET
+				st_mode=?,st_ino=?,st_dev=?,st_nlink=?,st_uid=?,st_gid=?,st_size=?,
+				st_atime=?,st_mtime=?,st_ctime=?,st_blocks=?,st_blksize=? WHERE id = ?''',
+				(stat.st_mode,stat.st_ino,stat.st_dev,stat.st_nlink,stat.st_uid,stat.st_gid,stat.st_size,
+				stat.st_atime,stat.st_mtime,stat.st_ctime,stat.st_blocks,stat.st_blksize, fid)
+			)
 	def get_stat(self, fid, cursor=None):
 		'''
 		по fid-у возвращает stat-поля из stat в виде объекта
@@ -531,7 +589,7 @@ class filesdb:
 			st_atime,st_mtime,st_ctime,st_blocks,st_blksize
 			FROM stat WHERE id = ?''',(fid,)
 		).fetchone()
-		return make_dict(st_mode=st_mode,st_ino=st_ino,st_dev=st_dev,st_nlink=st_nlink,st_uid=st_uid,st_gid=st_gid,st_size=st_size,
+		return make_dict(st_mode=st_mode,st_ino=st_ino,st_dev=st_dev+(2**64 if os.name=='nt' and st_dev<0 else 0),st_nlink=st_nlink,st_uid=st_uid,st_gid=st_gid,st_size=st_size,
 						   st_atime=st_atime,st_mtime=st_mtime,st_ctime=st_ctime,st_blocks=st_blocks,st_blksize=st_blksize)
 
 	# --------------------
@@ -549,7 +607,7 @@ class filesdb:
 
 		# рассчитываем, что src_path - обсолютный путь, не симлинк, не содержит // типа '/a//b/c'
 		path0 = path
-		path = path.split('/')
+		path = path.split(os.sep)
 
 		#print(ids,fid,path)
 		for name in path[len(ids):-1]:
@@ -559,11 +617,10 @@ class filesdb:
 			stat = os_stat(path0)
 		except Exception as e:
 			self.notify(0,path,type(e),e)
-			if name in dirs:
-				self.CUR.executemany('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (fid, path[-1], MDIR))
-				(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(fid, path[-1])).fetchone()
-				self.CUR.execute('INSERT INTO stat (id,type) VALUES (?,?)', (fid,MDIR))
-				self.notify('blindly create dir')
+			self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (fid, path[-1], MDIR))
+			(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(fid, path[-1])).fetchone()
+			self.CUR.execute('INSERT INTO stat (id,type) VALUES (?,?)', (fid,MDIR))
+			print('blindly create dir')
 		else:
 			self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (fid, path[-1], simple_type(stat.st_mode)))
 			(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(fid, path[-1])).fetchone()
@@ -579,17 +636,23 @@ class filesdb:
 			self.notify(0,'walk root_dirs:')
 			for root_dir in tqdm(root_dirs):
 				#self.notify(0,root_dir)
-				self._create_root(root_dir,self.CUR)
+				self._create_root(internal_path(root_dir),self.CUR)
 				for root, dirs, files in os.walk(root_dir):
-					pathids = self.path2ids(root,self.CUR)
+					pathids = self.path2ids(internal_path(root),self.CUR)
 					assert pathids[-1] is not None
 					#self.notify(0,root,pathids,dirs)
 					# при выполнении stat MFILE/MDIR может быть заменён на MLINK или MOTHER
 					for name in dirs+files:
 						try:
-							stat = os_stat(root+'/'+name)
+							name.encode("utf8", errors="surrogateescape")
 						except Exception as e:
-							self.notify(0,root+'/'+name,type(e),e)
+							print(root,repr(name))
+							continue
+
+						try:
+							stat = os_stat(root+os.sep+name)
+						except Exception as e:
+							self.notify(0,root+os.sep+name,type(e),e)
 							if name in dirs:
 								self.CUR.executemany('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (pathids[-1], name, MDIR))
 								(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(pathids[-1], name)).fetchone()
@@ -632,7 +695,7 @@ class filesdb:
 			(fid, name) = n
 			path.insert(0,name)
 		path.insert(0,'')
-		return '/'.join(path), deleted
+		return os.sep.join(path), deleted
 	def path2ids_d(self,path,cursor=None):
 		'''
 		то же что path2ids(), только ещё ищет в deleted
@@ -642,7 +705,7 @@ class filesdb:
 		ids = []
 		cur_id = 0
 		deleted = False
-		for name in path.split('/'):
+		for name in path.split(os.sep):
 			if name=='': continue
 			n = cursor.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(cur_id,name)).fetchone()
 			if n is None:
@@ -659,14 +722,14 @@ class filesdb:
 		if fid is None:
 			fid = os.getcwd()
 		if type(fid) is str:
-			fid = self.path2ids(normalize_path(os.path.abspath(fid)))[-1]
+			fid = self.path2ids(normalize_path(fid))[-1]
 			if fid is None: raise Exception('path does not exist')
 		return fid
-	def any2id_hist(self,fid):
+	def any2id_d(self,fid):
 		if fid is None:
 			fid = os.getcwd()
 		if type(fid) is str: 
-			fid = self.path2ids_d(normalize_path(os.path.abspath(fid)))[0][-1]
+			fid = self.path2ids_d(os.path.abspath(fid))[0][-1]
 			if fid is None: raise Exception('path does not exist')
 		return fid
 
@@ -854,7 +917,7 @@ class filesdb:
 					fid = fid[0]
 					path = None
 					try:
-						path = self.id2path(fid,cursor)
+						path = external_path(self.id2path(fid,cursor))
 						hsh = hashlib.md5(open(path,'rb').read()).hexdigest()
 					except FileNotFoundError:
 						self.set_modified(fid, cursor)
@@ -886,7 +949,7 @@ class filesdb:
 								self.raise_notify(e,fid)
 						elif ftype==MLINK:
 							try:
-								lnk = os.readlink(self.id2path(fid,cursor))
+								lnk = os.readlink(external_path(self.id2path(fid,cursor)))
 								(olink,) = cursor.execute('SELECT data FROM stat WHERE id = ?',(fid,)).fetchone()
 								if olink is not None and olink!=lnk:
 									self.modify(fid, os_stat(self.id2path(fid)), 2, cursor)
@@ -922,6 +985,7 @@ class filesdb:
 
 	def walk_stat1(self, with_all, did, *, progress=None, path='', typ=MDIR, modified=0):
 		# path, typ, modified - внутренние рекурсивные параметры, не предназначенные для внешнего вызова
+		# only_modified === not with_all
 		# если это не pre-root-dir
 		#	если это папака
 		#		просматриваем дочерние объeкты, какие есть и какие должны быть
@@ -929,7 +993,7 @@ class filesdb:
 		#		просматриваем которые остались(с учётом only_modified)
 		#		создаём новые и просматриваем их(modified=3)
 		#	если modified!=3
-		#		делаем stat, сравниваем с имеющимся
+		#		делаем stat текущего пути, сравниваем с имеющимся
 		#		если разные stat, есть созданные/удалённые, есть различия в дочерних - modified(); return True
 		# если pre-root-dir
 		#	просматриваем дочерние объeкты, какие есть(с учётом only_modified)
@@ -951,11 +1015,11 @@ class filesdb:
 				# просматриваем которые остались(с учётом only_modified)
 				for (name,fid,ctyp,cmodified) in children2:
 					if with_all or cmodified:
-						this_modified |= self.walk_stat1(with_all, fid, progress=progress, path=path+'/'+name, typ=ctyp, modified=cmodified)
+						this_modified |= self.walk_stat1(with_all, fid, progress=progress, path=path+os.sep+name, typ=ctyp, modified=cmodified)
 				# создаём новые и просматриваем их(modified=3)
 				for name in real_children:
 					this_modified = True
-					cpath = path+'/'+name
+					cpath = path+os.sep+name
 					try:
 						cstat = os_stat(cpath)
 					except FileNotFoundError:
@@ -973,7 +1037,7 @@ class filesdb:
 					print(path,"item may be alreay deleted")
 		else:
 			for (name,fid,ctyp,cmodified) in self.CUR.execute('SELECT name,id,type,modified FROM dirs WHERE parent_id = ?',(did,)).fetchall():
-				this_modified |= self.walk_stat1(with_all, fid, progress=progress, path=path+'/'+name, typ=ctyp, modified=cmodified)
+				this_modified |= self.walk_stat1(with_all, fid, progress=progress, path=path+os.sep+name, typ=ctyp, modified=cmodified)
 		return this_modified
 
 	def walk_stat(self, with_all, did):
@@ -996,7 +1060,7 @@ class filesdb:
 				def progress():
 					nonlocal count
 					count+=1
-					if __name__!="__main__" and count % (total // 100)==0:
+					if __name__!="__main__" and total>100 and count % (total // 100)==0:
 						pbar.update(total // 100)
 				self.walk_stat1(with_all, did, progress=progress)
 
@@ -1016,14 +1080,14 @@ class filesdb:
 			ids = self.path2ids(path,cursor)
 			
 		# рассчитываем, что src_path - обсолютный путь, не симлинк, не содержит // типа '/a//b/c'
-		path = path.split('/')
+		path = path.split(os.sep)
 
 		fid = ids[-2]
 		(owner,save) = self.owner_save(fid,cursor)
 
-		parent_path = '/'.join(path[:len(ids)])
+		parent_path = os.sep.join(path[:len(ids)])
 		for name in path[len(ids):-1]:
-			parent_path+= ('/'+name)
+			parent_path+= (os.sep+name)
 			lstat = os_stat(parent_path) # FileNotFoundError будет пойман в области watchdog-а
 			assert simple_type(lstat.st_mode)==MDIR, simple_type(lstat.st_mode)
 			fid = self.create(fid, name, lstat, True, cursor, owner, save)
@@ -1075,7 +1139,7 @@ class filesdb:
 	def modified(self, src_path, stat, is_directory, is_synthetic, cursor=None):
 		if cursor is None: cursor = self.CUR
 		self.notify(2, 'modified',src_path, stat, is_directory, is_synthetic, cursor)
-		src_path = normalize_path(src_path)
+		src_path = internal_path(src_path)
 		if is_synthetic:
 			print('synthetic modified',src_path, is_directory, datetime.fromtimestamp(time()))
 			return
@@ -1088,7 +1152,7 @@ class filesdb:
 	def created(self, src_path, stat, is_directory, is_synthetic, cursor=None):
 		if cursor is None: cursor = self.CUR
 		self.notify(2, 'created',src_path, stat, is_directory, is_synthetic, cursor)
-		src_path = normalize_path(src_path)
+		src_path = internal_path(src_path)
 		if is_synthetic:
 			print('synthetic created',src_path, is_directory, datetime.fromtimestamp(time()))
 			return
@@ -1102,7 +1166,7 @@ class filesdb:
 	def deleted(self, src_path, is_directory, is_synthetic, cursor=None):
 		if cursor is None: cursor = self.CUR
 		self.notify(2, 'deleted',src_path, is_directory, is_synthetic, cursor)
-		src_path = normalize_path(src_path)
+		src_path = internal_path(src_path)
 		if is_synthetic:
 			print('synthetic deleted',src_path, is_directory, datetime.fromtimestamp(time()))
 			return
@@ -1115,8 +1179,8 @@ class filesdb:
 	def moved(self, src_path, dest_path, stat, is_directory, is_synthetic, cursor=None):
 		if cursor is None: cursor = self.CUR
 		self.notify(2, 'moved',src_path, dest_path, stat, is_directory, is_synthetic, cursor)
-		src_path = normalize_path(src_path)
-		dest_path = normalize_path(dest_path)
+		src_path = internal_path(src_path)
+		dest_path = internal_path(dest_path)
 		if is_synthetic:
 			print('synthetic moved', is_directory, datetime.fromtimestamp(time()))
 			print('\t'+src_path)
@@ -1223,7 +1287,7 @@ class filesdb:
 		'''
 		#todo interval
 		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], fid, interval=interval)
-		fid = any2id_hist(fid)
+		fid = any2id_d(fid)
 		with self.CON:
 			self.CUR.execute('DELETE FROM hist WHERE id = ?)',(fid,))
 
@@ -1233,7 +1297,7 @@ class filesdb:
 		'''
 		#todo interval
 		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], fid, interval=interval)
-		fid = any2id_hist(fid)
+		fid = any2id_d(fid)
 		with self.CON:
 			self.CUR.execute('DELETE FROM hist WHERE id = ?)',(fid,))
 			fids = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? JOIN SELECT id FROM deleted  WHERE parent_id = ?',(fid,fid)).fetchall()
@@ -1260,7 +1324,7 @@ class filesdb:
 			если False - только для тех вложенных, у которых еще нет owner-а или он такой как у объекта path
 		in_deleted - устанавливать ли owner-а для удалённых объектов
 		'''
-		if self.server_in is not None: self.send2server(inspect.stack()[0][3], path, owner, replace_inner=replace_inner, in_deleted=in_deleted); return self.any2id_hist(path)
+		if self.server_in is not None: self.send2server(inspect.stack()[0][3], path, owner, replace_inner=replace_inner, in_deleted=in_deleted); return self.any2id_d(path)
 		with self.CON:
 			with closing(self.CON.cursor()) as cursor:
 				# oid - owner-id, который будем устанавливать
@@ -1269,7 +1333,7 @@ class filesdb:
 				else:
 					oid = None
 
-				fid = self.any2id_hist(path)
+				fid = self.any2id_d(path)
 				(oldoid,) = cursor.execute('SELECT owner FROM stat WHERE id = ?',(fid,)).fetchone()
 				cursor.execute('UPDATE stat SET owner = ? WHERE id = ?',(oid,fid))
 
@@ -1530,7 +1594,6 @@ class filesdb:
 	# --------------------------------
 
 	def info_fid(self, fid, *, interval=None):
-		'todo interval'
 		if fid==0:
 			return make_dict(
 				parent_id=0,
@@ -1879,7 +1942,7 @@ class filesdb:
 				else: assert False, etyp
 				if etyp=='V':
 					print(etyp+' '+('S' if static_found else 'W')+' '+str(datetime.fromtimestamp(time)),
-						 self.id2path_d(parent_id,self.CUR)[0]+'/'+name)
+						 self.id2path_d(parent_id,self.CUR)[0]+os.sep+name)
 				else:
 					print(etyp+' '+('S' if static_found else 'W')+' '+str(datetime.fromtimestamp(time)))
 
@@ -1895,15 +1958,16 @@ class filesdb:
 				n = self.CUR.execute('SELECT id, name, modified FROM dirs WHERE parent_id = ?',(did,)).fetchall()
 				for (fid, name, modified) in n:
 					if modified==2:
-						walk(fid, path+'/'+name)
+						walk(fid, path+os.sep+name)
 					else:
-						root_dirs.append(path+'/'+name)
+						root_dirs.append(external_path(path+os.sep+name))
 			walk(0, '')
 			return root_dirs
 
 	@staticmethod
 	def get_root_dirs():
 		'''определяет, за какими папками надо на самом деле следить, если указано следить за всей файловой системой'''
+		if os.name=='nt': return ['C:\\']
 		dirs = []
 		for rd in os.listdir(path='/'):
 			if rd in ['media','cdrom','mnt','proc','sys','dev','run']:
@@ -1958,11 +2022,13 @@ class filesdb:
 				root_dirs = [root_dirs]
 			if root_dirs==['/']:
 				root_dirs = self.get_root_dirs()
+				print('root_dirs:',root_dirs)
 			root_dirs = [os.path.abspath(x) for x in root_dirs]
 			self.FILES_DB = files_db
 			self.CON = sqlite3.connect(self.FILES_DB)
 			self.CUR = self.CON.cursor()
 			self.ROOT_DIRS = root_dirs
+			print('ROOT_DIRS:',self.ROOT_DIRS)
 			self.init_db(nohash)
 			if not nocheck and not ro:
 				self.check_integrity()
