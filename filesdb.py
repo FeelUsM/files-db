@@ -11,6 +11,8 @@ import subprocess
 import yaml
 import socket
 
+from typing import Optional, List, Any, Final, Self, Tuple, TextIO, Callable, cast, Set
+
 class AttrDict(dict):
 	def __getattr__(self, key):
 		if key not in self:
@@ -31,7 +33,7 @@ class NullContextManager(object):
 
 
 assert len(os.sep)==1
-def internal_path(path):
+def internal_path(path : str) -> str:
 	'''
 	преобразует путь из представления, понятного ОС во внутреннее представление:
 	элементы пути отделяются ровно одним os.sep
@@ -48,7 +50,7 @@ def internal_path(path):
 	if os.name=='nt':
 		path = os.sep+path
 	return path
-def external_path(path):
+def external_path(path : str) -> str:
 	'''
 	повторное применеие этой функции допустимо
 	'''
@@ -58,7 +60,7 @@ def external_path(path):
 		if path[0]==os.sep:
 			path = path[1:]
 	return path
-def normalize_path(path):
+def normalize_path(path : Optional[str]) -> str:
 	if path is None: path = os.getcwd()
 	return internal_path(os.path.abspath(path))
 
@@ -73,28 +75,28 @@ def normalize_path(path):
 # 2 - обнаружено путём сравнения хешей
 
 # dirs:type
-MFILE = 0
-MDIR = 1
-MLINK = 2
-MOTHER = 3 # встречаются всякие сокеты, именованные каналы. Не смотря на то, что в /sys, /dev, /proc, /run - не лезем
+MFILE : Final = 0
+MDIR : Final = 1
+MLINK : Final = 2
+MOTHER : Final = 3 # встречаются всякие сокеты, именованные каналы. Не смотря на то, что в /sys, /dev, /proc, /run - не лезем
 
-def os_stat(path,follow_symlinks=False):
+def os_stat(path : str, follow_symlinks : bool =False) -> os.stat_result:
 	return os.stat(external_path(path),follow_symlinks=follow_symlinks)
 
-def typ2str(x):
+def typ2str(x : int) -> str:
 	assert 0<=x<=3
 	return '-' if x==MFILE else \
 			'd'if x==MDIR else \
 			'l'if x==MLINK else \
 			'o'#if x==MOTHER
-def is_link(mode): return STAT.S_ISLNK(mode)
-def is_dir(mode):  return STAT.S_ISDIR(mode)
-def is_file(mode): return STAT.S_ISREG(mode)
-def is_other(mode):return STAT.S_ISCHR(mode) or STAT.S_ISBLK(mode) or\
+def is_link (mode : int) -> bool: return STAT.S_ISLNK(mode)
+def is_dir  (mode : int) -> bool: return STAT.S_ISDIR(mode)
+def is_file (mode : int) -> bool: return STAT.S_ISREG(mode)
+def is_other(mode : int) -> bool: return STAT.S_ISCHR(mode) or STAT.S_ISBLK(mode) or\
 					STAT.S_ISFIFO(mode) or STAT.S_ISSOCK(mode) or\
 					STAT.S_ISDOOR(mode) or STAT.S_ISPORT(mode) or\
 					STAT.S_ISWHT(mode)
-def simple_type(mode):
+def simple_type(mode : int) -> int:
 	typ = MLINK if STAT.S_ISLNK(mode) else\
 		MDIR if STAT.S_ISDIR(mode) else\
 		MFILE if STAT.S_ISREG(mode) else\
@@ -108,19 +110,19 @@ def simple_type(mode):
 	return typ
 
 
-ECREAT = 1 # в этом случае все старые записи == -1
-EMODIF = 2
-EMOVE = 3
-EDEL = 4
+ECREAT : Final = 1 # в этом случае все старые записи == -1
+EMODIF : Final = 2
+EMOVE : Final = 3
+EDEL : Final = 4
 
-def etyp2str(etyp):
+def etyp2str(etyp : int) -> str:
 	assert 1<=etyp<=4
 	return 'C' if etyp==ECREAT else\
 			'M'if etyp==EMODIF else\
 			'V'if etyp==EMOVE else\
 			'D'#if etyp==EDEL
 
-def stat_eq(stat, ostat):
+def stat_eq(stat : os.stat_result, ostat : os.stat_result) -> bool:
 	'''
 	сравнивает два stat-а на равенство
 	если это директории: должно совпадать всё кроме access_time и modification_time
@@ -153,33 +155,27 @@ def stat_eq(stat, ostat):
 	if simple_type(stat.st_mode)!=MDIR and stat.st_mtime != ostat.st_mtime:
 		#if VERBOSE>=2: print('st_mtime')
 		return False
-	if os.name!='nt' and stat.st_blocks != ostat.st_blocks:
+	if os.name!='nt' and stat.st_blocks != ostat.st_blocks: # type: ignore[attr-defined]
 		#if VERBOSE>=2: print('st_blocks')
 		return False
-	if os.name!='nt' and stat.st_blksize != ostat.st_blksize:
+	if os.name!='nt' and stat.st_blksize != ostat.st_blksize: # type: ignore[attr-defined]
 		#if VERBOSE>=2: print('st_blksize')
 		return False
 	return True
 
-def get_username_by_uid(uid):
+def get_username_by_uid(uid : int) -> str:
 	if os.name == 'nt':
 		return 'dummy'
 	else:
 		import pwd
-		try:
-			return pwd.getpwuid(uid).pw_name
-		except KeyError:
-			return None  # Если UID не существует
-def get_groupname_by_gid(gid):
+		return pwd.getpwuid(uid).pw_name # type: ignore[attr-defined]
+def get_groupname_by_gid(gid : int) -> str:
 	if os.name == 'nt':
 		return 'dummy'
 	else:
 		import grp
-		try:
-			return grp.getgrgid(gid).gr_name
-		except KeyError:
-			return None  # Если UID не существует
-def access2str(st_mode):
+		return grp.getgrgid(gid).gr_name # type: ignore[attr-defined]
+def access2str(st_mode : int) -> str:
 	mode = STAT.S_IMODE(st_mode)
 	assert mode < 2**11, mode
 	s = ''
@@ -196,7 +192,7 @@ def access2str(st_mode):
 
 class filesdb:
 
-	VERBOSE = 0.5
+	VERBOSE : float = 0.5
 	# 0.5 - сообщать об изменениях объектов, которые не имеют владельцев
 	# 1   - сообщать о записываемых событиях
 	# 1.2 - сообщать обо всех событиях
@@ -204,9 +200,9 @@ class filesdb:
 	# 1.5 - сообщать о событиях
 	# 2   - stat_eq и все функции событий
 	# 3   - owner_save
-	last_notification = time()
+	last_notification : float = time()
 
-	def notify(self, thr, *args, **kwargs):
+	def notify(self : Self, thr : float, *args, **kwargs) -> None:
 		assert type(thr) in (int,float)
 		if self.VERBOSE>=thr:
 			print(*args, **kwargs)
@@ -215,7 +211,7 @@ class filesdb:
 				sep = kwargs['sep'] if 'sep' in kwargs else ' '
 				message = sep.join(str(x) for x in args)
 				if os.name=='nt':
-					import plyer
+					import plyer # type: ignore
 					from plyer import notification
 					notification.notify(
 						title='filesdb',
@@ -227,7 +223,7 @@ class filesdb:
 						#)
 					)
 				else:
-					if os.getuid()==0:
+					if os.getuid()==0: # type: ignore[attr-defined]
 						try:
 							username = 'feelus'
 							title = 'filesdb:'
@@ -246,13 +242,13 @@ class filesdb:
 					else:
 						os.system('notify-send filesdb: "'+message+'"')
 
-	def raise_notify(self,e,*args):
+	def raise_notify(self : Self, e : Optional[Exception], *args) -> None:
 		'''
 		исключение после которого можно прожолжить работу, сделав уведомление
 		но если в интерактивном режиме - то лучше упасть с остановкой
 		'''
 		if __name__=='__main__':
-			print_exception(type(e), e, e.__traceback__, chain=True)
+			print_exception(type(e), e, e.__traceback__ if e is not None else None, chain=True) # type: ignore[arg-type]
 			print()
 			print('The above exception was the direct cause of the following exception:')
 			print()
@@ -265,16 +261,16 @@ class filesdb:
 			if e is None: raise elocal
 			else:         raise elocal from e
 
-	def set_VERBOSE(self,x):
+	def set_VERBOSE(self : Self , x : float) -> None:
 		self.VERBOSE = x
 
-	def get_VERBOSE(self):
+	def get_VERBOSE(self : Self) -> None:
 		self.notify(0, self.VERBOSE)
 
-	FILES_DB = None
-	ROOT_DIRS = None
-	CON = None
-	CUR = None
+	FILES_DB : str
+	ROOT_DIRS : List[str]
+	CON : sqlite3.Connection
+	CUR : sqlite3.Cursor
 
 	keyboard_thr = None
 	commit_thr = None
@@ -283,7 +279,7 @@ class filesdb:
 	# схема данных
 	# -------------
 
-	def _create_tables(self):
+	def _create_tables(self : Self) -> None:
 		with self.CON:
 			self.CUR.execute('''CREATE TABLE dirs (
 				parent_id INTEGER NOT NULL,                  /* id папки, в которой лежит данный объект */
@@ -390,7 +386,7 @@ class filesdb:
 			self.CUR.execute('CREATE INDEX id_owners ON owners (id)')
 			self.CUR.execute('CREATE INDEX name_owners ON owners (name)')
 
-	def check_integrity(self):
+	def check_integrity(self : Self) -> None:
 		'''
 		проверяет
 		присутствуют таблицы: dirs, stat, deleted, hist, owners
@@ -505,14 +501,14 @@ class filesdb:
 	# общие функции образа ФС
 	# --------------
 
-	def path2ids(self,path,cursor=None):
+	def path2ids(self : Self, path : str, cursor : Optional[sqlite3.Cursor] =None) -> List[Optional[int]]:
 		'''
 		преобразовывает путь(внутренний) в последовательность id-ов всех родительских папок
 		Если в какой-то момент не удалось найти очередную папку - последовательность будет заканчиваться Nane-ом
 		id объекта, задаваемого путём находится в последнй ячейке массива
 		'''
 		if cursor is None: cursor = self.CUR
-		ids = []
+		ids : List[Optional[int]] = []
 		cur_id = 0
 		for name in path.split(os.sep):
 			if name=='': continue
@@ -523,7 +519,7 @@ class filesdb:
 			cur_id = n[0]
 			ids.append(cur_id)
 		return ids
-	def id2path(self,fid,cursor=None):
+	def id2path(self : Self, fid : int, cursor : Optional[sqlite3.Cursor] =None) -> str:
 		'''
 		преобразовывает id в путь(внутренний)
 		'''
@@ -537,7 +533,7 @@ class filesdb:
 		return path
 
 	# unused method
-	def is_modified(self, fid, cursor=None):
+	def is_modified(self :Self, fid : int, cursor : Optional[sqlite3.Cursor] =None) -> bool:
 		'''
 		просто замена одному запросу в БД
 		'''
@@ -545,7 +541,7 @@ class filesdb:
 		n = cursor.execute('SELECT modified FROM dirs WHERE id = ?',(fid,)).fetchone()
 		if n is None: raise Exception(f"can't find fid {fid}")
 		return n[0]==1
-	def set_modified(self, fid, cursor=None):
+	def set_modified(self : Self, fid : int, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		'''
 		выставляет modified в объект и в его родителя, если тот ещё не, и так рекурсивно
 		'''
@@ -558,7 +554,7 @@ class filesdb:
 			cursor.execute('UPDATE dirs SET modified = 1 WHERE id = ?',(fid,))
 			self.set_modified(n[0], cursor=None)
 		
-	def update_stat(self, fid, stat, cursor=None):
+	def update_stat(self : Self, fid : int, stat : os.stat_result, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		'''
 		по fid-у заполняет stat-поля в stat
 		'''
@@ -575,9 +571,9 @@ class filesdb:
 				st_mode=?,st_ino=?,st_dev=?,st_nlink=?,st_uid=?,st_gid=?,st_size=?,
 				st_atime=?,st_mtime=?,st_ctime=?,st_blocks=?,st_blksize=? WHERE id = ?''',
 				(stat.st_mode,stat.st_ino,stat.st_dev,stat.st_nlink,stat.st_uid,stat.st_gid,stat.st_size,
-				stat.st_atime,stat.st_mtime,stat.st_ctime,stat.st_blocks,stat.st_blksize, fid)
+				stat.st_atime,stat.st_mtime,stat.st_ctime,stat.st_blocks,stat.st_blksize, fid) # type: ignore[attr-defined]
 			)
-	def get_stat(self, fid, cursor=None):
+	def get_stat(self : Self, fid : int, cursor : Optional[sqlite3.Cursor] =None) -> os.stat_result:
 		'''
 		по fid-у возвращает stat-поля из stat в виде объекта
 		'''
@@ -596,9 +592,10 @@ class filesdb:
 	# инициализация БД
 	# --------------------
 
-	def _create_root(self, path,cursor=None):
+	def _create_root(self : Self, path : str, cursor : Optional[sqlite3.Cursor] =None) -> int:
 		'''
 		создает корневые директории в дереве dirs (помечает родительские директории к path как pre-root-dir)
+		возвращает fid созданной директории
 		'''
 		if cursor is None: cursor = self.CUR
 		ids = self.path2ids(path,cursor)
@@ -606,33 +603,36 @@ class filesdb:
 		fid = 0 if len(ids)==1 else ids[-2]
 
 		# рассчитываем, что src_path - обсолютный путь, не симлинк, не содержит // типа '/a//b/c'
-		path0 = path
-		path = path.split(os.sep)
+		pathl = path.split(os.sep)
 
-		#print(ids,fid,path)
-		for name in path[len(ids):-1]:
+		#print(ids,fid,pathl)
+		for name in pathl[len(ids):-1]:
 			cursor.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 2, ?)',(fid, name, MDIR))
 			(fid,) = cursor.execute('SELECT id FROM dirs WHERE parent_id =? AND name=?',(fid,name)).fetchone()
+			assert fid is not None
 		try:
-			stat = os_stat(path0)
+			stat = os_stat(path)
 		except Exception as e:
-			self.notify(0,path,type(e),e)
-			self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (fid, path[-1], MDIR))
-			(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(fid, path[-1])).fetchone()
+			self.notify(0,pathl,type(e),e)
+			self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (fid, pathl[-1], MDIR))
+			(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(fid, pathl[-1])).fetchone()
+			assert fid is not None
 			self.CUR.execute('INSERT INTO stat (id,type) VALUES (?,?)', (fid,MDIR))
 			print('blindly create dir')
 		else:
-			self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (fid, path[-1], simple_type(stat.st_mode)))
-			(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(fid, path[-1])).fetchone()
+			self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (fid, pathl[-1], simple_type(stat.st_mode)))
+			(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(fid, pathl[-1])).fetchone()
+			assert fid is not None
 			self.CUR.execute('INSERT INTO stat (id,type) VALUES (?,?)', (fid,simple_type(stat.st_mode)))
 			self.update_stat(fid,stat,self.CUR)
 		return fid
 
-	def _init_cur(self, root_dirs):
+	def _init_cur(self : Self, root_dirs : List[str]) -> None:
 		'''
 		обходит ФС из root_dirs и заполняет таблицу dirs
 		'''
 		with self.CON:
+			t = time()
 			self.notify(0,'walk root_dirs:')
 			for root_dir in tqdm(root_dirs):
 				#self.notify(0,root_dir)
@@ -640,6 +640,9 @@ class filesdb:
 				for root, dirs, files in os.walk(root_dir):
 					pathids = self.path2ids(internal_path(root),self.CUR)
 					assert pathids[-1] is not None
+					if time()-t>10:
+						print('...',root)
+						t = time()
 					#self.notify(0,root,pathids,dirs)
 					# при выполнении stat MFILE/MDIR может быть заменён на MLINK или MOTHER
 					for name in dirs+files:
@@ -654,7 +657,7 @@ class filesdb:
 						except Exception as e:
 							self.notify(0,root+os.sep+name,type(e),e)
 							if name in dirs:
-								self.CUR.executemany('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (pathids[-1], name, MDIR))
+								self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (pathids[-1], name, MDIR))
 								(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(pathids[-1], name)).fetchone()
 								self.CUR.execute('INSERT INTO stat (id,type) VALUES (?,?)', (fid,MDIR))
 								self.notify(0,'blindly create dir')
@@ -664,7 +667,7 @@ class filesdb:
 							self.CUR.execute('INSERT INTO stat (id,type) VALUES (?,?)', (fid,simple_type(stat.st_mode)))
 							self.update_stat(fid,stat,self.CUR)
 
-	def init_db(self, nohash):
+	def init_db(self : Self, nohash : bool) -> None:
 		'''
 		создаёт и инициализирует таблицы
 		'''
@@ -677,13 +680,13 @@ class filesdb:
 	# общие функции событий
 	# ---------------------
 
-	def id2path_d(self,fid,cursor=None):
+	def id2path_d(self : Self, fid : int, cursor : Optional[sqlite3.Cursor] =None) -> Tuple[str, bool]:
 		'''
 		то же что id2path(), только ещё ищет в deleted
 		возвращает (path, deleted: Bool)
 		'''
 		if cursor is None: cursor = self.CUR
-		path = []
+		path : List[str] = []
 		deleted = False
 		while fid!=0:
 			n = cursor.execute('SELECT parent_id, name FROM dirs WHERE id = ?',(fid,)).fetchone()
@@ -696,13 +699,13 @@ class filesdb:
 			path.insert(0,name)
 		path.insert(0,'')
 		return os.sep.join(path), deleted
-	def path2ids_d(self,path,cursor=None):
+	def path2ids_d(self : Self, path : str, cursor : Optional[sqlite3.Cursor] =None) -> Tuple[List[Optional[int]], bool]:
 		'''
 		то же что path2ids(), только ещё ищет в deleted
 		возвращает (ids, deleted: Bool)
 		'''
 		if cursor is None: cursor = self.CUR
-		ids = []
+		ids : List[Optional[int]] = []
 		cur_id = 0
 		deleted = False
 		for name in path.split(os.sep):
@@ -712,28 +715,30 @@ class filesdb:
 				deleted = True
 				n = cursor.execute('SELECT id FROM deleted WHERE parent_id = ? AND name = ?',(cur_id,name)).fetchone()
 				if n is None:
-					return ids+[None]
+					return ids+[None], deleted
 					#raise Exception(f"can't find {name} in {cur_id}")
 			cur_id = n[0]
 			ids.append(cur_id)
 		return ids, deleted
 
-	def any2id(self,fid):
+	def any2id(self : Self, fid : None|int|str) -> int:
 		if fid is None:
 			fid = os.getcwd()
 		if type(fid) is str:
 			fid = self.path2ids(normalize_path(fid))[-1]
 			if fid is None: raise Exception('path does not exist')
+		assert type(fid)is int
 		return fid
-	def any2id_d(self,fid):
+	def any2id_d(self : Self, fid : None|int|str) -> int:
 		if fid is None:
 			fid = os.getcwd()
 		if type(fid) is str: 
 			fid = self.path2ids_d(os.path.abspath(fid))[0][-1]
 			if fid is None: raise Exception('path does not exist')
+		assert type(fid) is int
 		return fid
 
-	def owner_save(self,fid,cursor=None):
+	def owner_save(self : Self, fid : int, cursor : Optional[sqlite3.Cursor] =None) -> Tuple[int, bool]:
 		'''
 		определяет владельца и надо ли сохранять события, связанные с этим файлом
 		'''
@@ -746,7 +751,7 @@ class filesdb:
 			save = True
 		return (owner,save)
 
-	def add_event(self, fid, typ, etyp, static_found, owner, cursor=None):
+	def add_event(self : Self, fid : int, typ : None|int, etyp : int, static_found : bool|int, owner : None|int, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		'''
 		создает запись в hist
 		если событие ECREAT: заполняет большинство полей -1
@@ -788,9 +793,9 @@ class filesdb:
 						   (fid,typ,etyp,ltime,static_found,fid,fid)
 			)
 		if self.VERBOSE>=1 or owner is None and self.VERBOSE>0:
-			self.notify(0,datetime.fromtimestamp(ltime), etyp2str(etyp), fid, typ2str(typ), self.id2path_d(fid,cursor)[0])
+			self.notify(0,datetime.fromtimestamp(ltime), etyp2str(etyp), fid, typ2str(typ) if typ is not None else None, self.id2path_d(fid,cursor)[0])
 
-	def modify(self, fid, stat, static_found, cursor=None):
+	def modify(self : Self, fid : int, stat : os.stat_result, static_found : bool|int, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		'''
 		известно, что объект fid изменился, известен его новый stat
 		'''
@@ -825,7 +830,9 @@ class filesdb:
 			elif save1:
 				self.notify(1.2,'modify',fid, self.id2path(fid, cursor), static_found)
 		
-	def create(self, parent_id, name, stat, static_found, cursor=None, owner=None, save=None):
+	def create(self : Self, parent_id : int, name : str, stat : os.stat_result, static_found : bool|int, cursor : Optional[sqlite3.Cursor] =None, 
+			owner : Optional[int]=None, save : Optional[bool]=None
+	) -> None:
 		'''
 		создается объект, родительская директория которого уже существует
 		save, owner определяются родительской папкой или из таблицы deleted
@@ -863,7 +870,7 @@ class filesdb:
 
 		return fid
 		
-	def delete(self, fid, static_found, cursor=None):
+	def delete(self : Self, fid : int, static_found : bool|int, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		'''
 		удаляем существующий объект fid
 		а также его потомков, если они существуют
@@ -871,7 +878,7 @@ class filesdb:
 		if cursor is None: cursor = self.CUR
 		(owner,save) = self.owner_save(fid,cursor)
 
-		def my_walk(did):
+		def my_walk(did : int) -> None:
 			n = cursor.execute('SELECT name,id,type FROM dirs WHERE parent_id = ? ',(did,)).fetchall()
 			for name,fid,ftype in n:
 				if ftype==MDIR:
@@ -902,7 +909,7 @@ class filesdb:
 	# функции статического обновления
 	# --------------------------------
 
-	def update_hashes(self, with_all=False):
+	def update_hashes(self : Self, with_all : bool =False) -> None:
 		import hashlib
 		# todo calc only unknown hashes
 		with self.CON:
@@ -937,9 +944,9 @@ class filesdb:
 		# обновить симлинки, директории, сынтегрировать хеши
 		with self.CON:
 			with closing(self.CON.cursor()) as cursor:
-				def my_walk(did,root):
+				def my_walk(did : int, root : bool) -> int|None:
 					n = cursor.execute('SELECT name,id,type,modified FROM dirs WHERE parent_id = ? ',(did,)).fetchall()
-					hsh = 0
+					hsh : int|None = 0
 					for name,fid,ftype,modified in n:
 						if ftype==MFILE:
 							try:
@@ -976,14 +983,14 @@ class filesdb:
 							hsh += int(lhsh, 16)
 
 					if hsh is not None:
-						hsh = hex( hsh%(2**32) )[2:].zfill(32)
+						shsh = hex( hsh%(2**32) )[2:].zfill(32)
 						if not root:
-							cursor.execute('UPDATE stat SET data = ? WHERE id = ?',(hsh,did))
+							cursor.execute('UPDATE stat SET data = ? WHERE id = ?',(shsh,did))
 							cursor.execute('UPDATE dirs SET modified = 0 WHERE id = ?',(did,))
 					return hsh
 				my_walk(0,True)
 
-	def walk_stat1(self, with_all, did, *, progress=None, path='', typ=MDIR, modified=0):
+	def walk_stat1(self : Self, with_all : bool, did : int, *, progress : Optional[Callable[[],None]]=None, path : str='', typ : int=MDIR, modified : int=0) -> bool:
 		# path, typ, modified - внутренние рекурсивные параметры, не предназначенные для внешнего вызова
 		# only_modified === not with_all
 		# если это не pre-root-dir
@@ -1001,7 +1008,7 @@ class filesdb:
 		if did!=0 and modified!=2:
 			if typ==MDIR:
 				children = self.CUR.execute('SELECT name,id,type,modified FROM dirs WHERE parent_id = ?',(did,)).fetchall()
-				real_children = os.listdir(path)
+				real_children = os.listdir(external_path(path))
 				children2 = []
 				# удаляем удалённые
 				for (name,fid,ctyp,cmodified) in children:
@@ -1040,7 +1047,7 @@ class filesdb:
 				this_modified |= self.walk_stat1(with_all, fid, progress=progress, path=path+os.sep+name, typ=ctyp, modified=cmodified)
 		return this_modified
 
-	def walk_stat(self, with_all, did):
+	def walk_stat(self : Self, with_all : bool, did : int) -> None:
 		'''
 		основная цель: найти изменения, которые не были пойманы watchdog-ом
 		with_all === not only_modified
@@ -1057,36 +1064,36 @@ class filesdb:
 		with self.CON:
 			with (tqdm(total=total, desc="Progress") if __name__!="__main__" else NullContextManager(None)) as pbar:
 				count = 0
-				def progress():
+				def progress() -> None:
 					nonlocal count
 					count+=1
 					if __name__!="__main__" and total>100 and count % (total // 100)==0:
 						pbar.update(total // 100)
 				self.walk_stat1(with_all, did, progress=progress)
 
-	def walk_stat_all(self):
+	def walk_stat_all(self : Self) -> None:
 		self.walk_stat(True, 0)
-	def walk_stat_modified(self):
+	def walk_stat_modified(self : Self) -> None:
 		self.walk_stat(False, 0)
 
 	# --------------------------------
 	# функции динамического обновления
 	# --------------------------------
 
-	def create_parents(self, path, cursor=None, ids=None):
+	def create_parents(self : Self, path : str, cursor : Optional[sqlite3.Cursor] =None, ids=None) -> Tuple[int, str, int, bool]:
 		if cursor is None: cursor = self.CUR
 		self.notify(2, 'create_parents',path,cursor,ids)
 		if ids is None:
 			ids = self.path2ids(path,cursor)
 			
 		# рассчитываем, что src_path - обсолютный путь, не симлинк, не содержит // типа '/a//b/c'
-		path = path.split(os.sep)
+		pathl = path.split(os.sep)
 
 		fid = ids[-2]
 		(owner,save) = self.owner_save(fid,cursor)
 
-		parent_path = os.sep.join(path[:len(ids)])
-		for name in path[len(ids):-1]:
+		parent_path = os.sep.join(pathl[:len(ids)])
+		for name in pathl[len(ids):-1]:
 			parent_path+= (os.sep+name)
 			lstat = os_stat(parent_path) # FileNotFoundError будет пойман в области watchdog-а
 			assert simple_type(lstat.st_mode)==MDIR, simple_type(lstat.st_mode)
@@ -1094,13 +1101,13 @@ class filesdb:
 
 		return fid, path[-1], owner, save
 
-	def create1(self, ids, src_path, stat, is_directory, cursor=None):
+	def create1(self : Self, ids : List[None|int], src_path : str, stat : os.stat_result, is_directory : bool, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		if cursor is None: cursor = self.CUR
 		self.notify(2, 'created1',ids, src_path, stat, is_directory, cursor)
 		(fid, name, owner, save) = self.create_parents(src_path,cursor,ids)
 		self.create(fid, name, stat, False, cursor, owner, save)
 
-	def move_deleted(self, ofid, nfid, cursor=None):
+	def move_deleted(self : Self, ofid : int, nfid : int, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		'''
 		в deleted у потомков ofid меняет предка на nfid
 		а если происходит коллизия по имени с dirs - удаляет его и применяется рекурсивно
@@ -1116,7 +1123,7 @@ class filesdb:
 			else:
 				cursor.execute('UPDATE deleted SET parent_id=? WHERE id = ?',(nfid,fid))
 
-	def move(self, fid, dest_path, cursor=None):
+	def move(self : Self, fid : int, dest_path : str, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		'''
 		существующий объект fid перемещается на новое место
 		фактически у него изменяется только parent_id, name
@@ -1136,7 +1143,7 @@ class filesdb:
 			cursor.execute('DELETE FROM deleted WHERE parent_id=? AND name=?',(parent_id, name))
 			self.move_deleted(n[0], fid, cursor)
 
-	def modified(self, src_path, stat, is_directory, is_synthetic, cursor=None):
+	def modified(self : Self, src_path : str, stat : os.stat_result, is_directory : bool, is_synthetic : bool, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		if cursor is None: cursor = self.CUR
 		self.notify(2, 'modified',src_path, stat, is_directory, is_synthetic, cursor)
 		src_path = internal_path(src_path)
@@ -1149,7 +1156,7 @@ class filesdb:
 			return self.create1(ids, src_path, stat, is_directory,cursor)
 		return self.modify(ids[-1], stat, False, cursor)
 
-	def created(self, src_path, stat, is_directory, is_synthetic, cursor=None):
+	def created(self : Self, src_path : str, stat : os.stat_result, is_directory : bool, is_synthetic : bool, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		if cursor is None: cursor = self.CUR
 		self.notify(2, 'created',src_path, stat, is_directory, is_synthetic, cursor)
 		src_path = internal_path(src_path)
@@ -1163,7 +1170,7 @@ class filesdb:
 			return self.modify(ids[-1], stat, False, cursor)
 		return self.create1(ids, src_path, stat, is_directory,cursor)
 
-	def deleted(self, src_path, is_directory, is_synthetic, cursor=None):
+	def deleted(self : Self, src_path : str, is_directory : bool, is_synthetic : bool, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		if cursor is None: cursor = self.CUR
 		self.notify(2, 'deleted',src_path, is_directory, is_synthetic, cursor)
 		src_path = internal_path(src_path)
@@ -1176,7 +1183,7 @@ class filesdb:
 			return
 		self.delete(ids[-1], False, cursor)
 
-	def moved(self, src_path, dest_path, stat, is_directory, is_synthetic, cursor=None):
+	def moved(self : Self, src_path : str, dest_path : str, stat : os.stat_result, is_directory : bool, is_synthetic : bool, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		if cursor is None: cursor = self.CUR
 		self.notify(2, 'moved',src_path, dest_path, stat, is_directory, is_synthetic, cursor)
 		src_path = internal_path(src_path)
@@ -1195,7 +1202,8 @@ class filesdb:
 	# --------------------------------
 	# интерфейсные функции
 	# --------------------------------
-	def send2server(self, name,*args,**kwargs):
+	def send2server(self : Self, name : str, *args, **kwargs) -> None:
+		assert self.server_in is not None
 		if len(name)==1:
 			message = name+'\n'
 		else:
@@ -1206,7 +1214,7 @@ class filesdb:
 			print(message, file=self.server_in, end='')
 			self.server_in.flush()
 
-	def reset_modified(self):
+	def reset_modified(self : Self) -> None:
 		'''
 		сбрасывает все modified флаги
 		'''
@@ -1214,7 +1222,7 @@ class filesdb:
 		with self.CON:
 			self.CUR.execute('UPDATE dirs SET modified =0 WHERE modified==1')
 
-	def create_owner(self, name, save):
+	def create_owner(self : Self, name : str, save : bool) -> None:
 		'''
 		создает владельца, возвращает его id
 		'''
@@ -1225,7 +1233,7 @@ class filesdb:
 			self.CUR.execute('INSERT INTO owners (name, save) VALUES (?, ?)', (name,save))
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 
-	def update_owner(self, name, save):
+	def update_owner(self : Self, name : str, save : bool) -> None:
 		'''
 		у существующего владельца обновляет параметр save, возвращает его id
 		'''
@@ -1236,7 +1244,7 @@ class filesdb:
 			self.CUR.execute('UPDATE owners SET save = ? WHERE name = ?', (save,name))
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 
-	def credate_owner(self, name, save):
+	def credate_owner(self : Self, name : str, save : bool) -> None:
 		'''
 		создаёт владельца, а если он уже существует, то только обновляет его параметр save. Возвращает его id
 		'''
@@ -1248,7 +1256,7 @@ class filesdb:
 				name = excluded.name,    save = excluded.save ''', (name,save))
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 
-	def del_owner(self, owner):
+	def del_owner(self : Self, owner : str) -> None:
 		'''
 		удаляет владельца и все упоминания о нём из таблиц stat, deleted
 		'''
@@ -1258,7 +1266,7 @@ class filesdb:
 			self.CUR.execute('UPDATE deleted  SET owner  = NULL WHERE deleted.owner  = (SELECT owners.id FROM owners WHERE owners.name = ?)',(owner,))
 			self.CUR.execute('DELETE FROM owners WHERE name = ?',(owner,))
 		
-	def del_owner_hist(self, owner):
+	def del_owner_hist(self : Self, owner : str) -> None:
 		'''
 		удаляет владельца и все упоминания о нём из таблиц stat, deleted
 		а также удалает из hist все записи, в которых упоминается этот владелец
@@ -1271,7 +1279,7 @@ class filesdb:
 			self.CUR.execute('UPDATE deleted  SET owner = NULL WHERE deleted.owner  = (SELECT owners.id FROM owners WHERE owners.name = ?)',(owner,))
 			self.CUR.execute('DELETE FROM owners WHERE name = ?',(owner,))
 
-	def del_hist_owner(self, owner, interval=None):
+	def del_hist_owner(self : Self, owner : str, interval=None) -> None:
 		'''
 		удалает из hist все записи, в которых упоминается этот владелец
 		'''
@@ -1281,23 +1289,23 @@ class filesdb:
 			self.CUR.execute('DELETE FROM hist WHERE hist.id IN (SELECT stat.id FROM stat JOIN owners ON stat.owner=owners.id WHERE owners.name = ?)',(owner,))
 			self.CUR.execute('DELETE FROM hist WHERE hist.id IN (SELECT deleted.id FROM deleted JOIN owners ON deleted.owner=owners.id WHERE owners.name = ?)',(owner,))
 
-	def del_hist_id(self, fid, interval=None):
+	def del_hist_id(self : Self, fid : int, interval=None) -> None:
 		'''
 		удаляет из истории все записи про заданный объект
 		'''
 		#todo interval
 		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], fid, interval=interval)
-		fid = any2id_d(fid)
+		fid = self.any2id_d(fid)
 		with self.CON:
 			self.CUR.execute('DELETE FROM hist WHERE id = ?)',(fid,))
 
-	def del_hist_id_recursive(self, fid, interval=None):
+	def del_hist_id_recursive(self : Self, fid : int, interval=None) -> None:
 		'''
 		удаляет из истории все записи про заданный объект и его дочерние объекты
 		'''
 		#todo interval
 		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], fid, interval=interval)
-		fid = any2id_d(fid)
+		fid = self.any2id_d(fid)
 		with self.CON:
 			self.CUR.execute('DELETE FROM hist WHERE id = ?)',(fid,))
 			fids = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? JOIN SELECT id FROM deleted  WHERE parent_id = ?',(fid,fid)).fetchall()
@@ -1309,12 +1317,12 @@ class filesdb:
 					fids2+= self.CUR.execute('SELECT id FROM deleted  WHERE parent_id = ?',(fid,)).fetchall()
 				fids = fids2
 
-	def rename_owner(self, oname, name):
+	def rename_owner(self : Self, oname : str, name : str) -> None:
 		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], oname, name)
 		with self.CON:
 			self.CUR.execute('UPDATE owners SET name = ? WHERE name = ?',(name,oname))
 
-	def set_owner(self, path, owner, *, replace_inner=False, in_deleted=True):
+	def set_owner(self : Self, path : str, owner : str, *, replace_inner : bool =False, in_deleted : bool =True) -> int:
 		'''
 		если такого owner-а еще нет - он создаётся
 		save - надо ли в будущем сохранять события изменений этих файлов
@@ -1323,6 +1331,7 @@ class filesdb:
 			если True - устанавливает owner-а для всех вложенных объектов
 			если False - только для тех вложенных, у которых еще нет owner-а или он такой как у объекта path
 		in_deleted - устанавливать ли owner-а для удалённых объектов
+		возвращает fid файла
 		'''
 		if self.server_in is not None: self.send2server(inspect.stack()[0][3], path, owner, replace_inner=replace_inner, in_deleted=in_deleted); return self.any2id_d(path)
 		with self.CON:
@@ -1337,7 +1346,7 @@ class filesdb:
 				(oldoid,) = cursor.execute('SELECT owner FROM stat WHERE id = ?',(fid,)).fetchone()
 				cursor.execute('UPDATE stat SET owner = ? WHERE id = ?',(oid,fid))
 
-				def my_walk(did):
+				def my_walk(did : int) -> None:
 					#self.notify(0,'my_walk',did)
 					if True:
 						if replace_inner:
@@ -1366,19 +1375,19 @@ class filesdb:
 				my_walk(fid)
 				return fid
 
-	def set_create_owner(self, path, owner, save, *, del_hist=False, replace_inner=False, in_deleted=True):
+	def set_create_owner(self : Self, path : str, owner : str, save : bool, *, del_hist : bool =False, replace_inner : bool =False, in_deleted : bool =True) -> None:
 		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], path, owner, save, del_hist=del_hist, replace_inner=replace_inner, in_deleted=in_deleted)
 		self.create_owner(owner, save)
 		self.set_owner(path, owner, replace_inner=replace_inner, in_deleted=in_deleted)
 		if del_hist: self.del_hist_owner(owner)
 
-	def set_credate_owner(self, path, owner, save, *, del_hist=False, replace_inner=False, in_deleted=True):
+	def set_credate_owner(self : Self, path : str, owner : str, save : bool, *, del_hist : bool =False, replace_inner : bool =False, in_deleted : bool=True) -> None:
 		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], path, owner, save, del_hist=del_hist, replace_inner=replace_inner, in_deleted=in_deleted)
 		self.credate_owner(owner, save)
 		self.set_owner(path, owner, replace_inner=replace_inner, in_deleted=in_deleted)
 		if del_hist: self.del_hist_owner(owner)
 
-	def help(self):
+	def help(self : Self) -> None:
 		if self.server_in is not None: return self.send2server(inspect.stack()[0][3])
 		print('''
 		syntax: yaml list of
@@ -1408,7 +1417,7 @@ class filesdb:
 		help()
 			''')
 
-	def watch(self, do_stat = True):
+	def watch(self : Self, do_stat : bool = True) -> None:
 		'''запускает watchdog, который ловит события файловой системы
 		также может выполнять команды из stdin'''
 		# взаимодействуем с ФС
@@ -1441,6 +1450,8 @@ class filesdb:
 		#		print('moved',src_path)
 			
 		def my_event_handler(event: FileSystemEvent) -> None:
+			assert isinstance(event.src_path, str)
+			assert isinstance(event.dest_path, str)
 			if event.event_type=='closed_no_write':
 				self.notify(1.5, 'pass closed_no_write',event.src_path)
 				pass
@@ -1479,10 +1490,10 @@ class filesdb:
 			else:
 				self.raise_notify(None,event)
 
-		q = Queue()
+		q : Queue = Queue()
 
 		class MyEventHandler(FileSystemEventHandler):
-			def on_any_event(self, event: FileSystemEvent) -> None:
+			def on_any_event(self : Self, event: FileSystemEvent) -> None:
 				if event.event_type=='closed_no_write':
 					pass
 				elif event.event_type=='opened':
@@ -1490,7 +1501,7 @@ class filesdb:
 				else:
 					#print('put',event.event_type,event.src_path)
 					q.put(event)
-		def observe(root_dirs):
+		def observe(root_dirs : List[str]):
 			event_handler = MyEventHandler()  # Создаем обработчик с временным значением shared_data
 			observer = Observer()
 
@@ -1502,7 +1513,7 @@ class filesdb:
 		self.notify(0,"All started...", threading.current_thread().name, datetime.fromtimestamp(time()))
 
 
-		def keyboard_monitor():
+		def keyboard_monitor() -> None:
 			x= ''
 			while x!='q':
 				try:
@@ -1517,7 +1528,7 @@ class filesdb:
 			self.notify(1.5,'keep old keyboard_thr')
 
 		stopped = False
-		def commit_monitor():
+		def commit_monitor() -> None:
 			while not stopped:
 				sleep(60)
 				q.put('u')
@@ -1593,9 +1604,42 @@ class filesdb:
 	# мониторинговые функции
 	# --------------------------------
 
-	def info_fid(self, fid, *, interval=None):
+	class InfoFid:
+		def __init__(self,
+				parent_id: int,
+				name	:str,
+				fid		:int,
+				typ		:int,
+				modified:int,
+				deleted	:int|bool,
+				path	:str,
+				ids		:List[int],
+				data	:str|None,
+				stat	:os.stat_result|None,
+				count_static:int,
+				count	:int,
+				oname	:str|None,
+				save	:bool,
+				oid		:int|None)->None:
+			self.parent_id: int = parent_id
+			self.name	:str = name
+			self.fid	:int = fid
+			self.typ	:int = typ
+			self.modified:int = modified
+			self.deleted:int|bool = deleted
+			self.path	:str = path
+			self.ids	:List[int] = ids
+			self.data	:str|None = data
+			self.stat	:os.stat_result|None = stat
+			self.count_static:int = count_static
+			self.count	:int = count
+			self.oname	:str|None = oname
+			self.save	:bool = save
+			self.oid	:int|None = oid
+
+	def info_fid(self : Self, fid : int, *, interval : None|Tuple[None|float, None|float] =None) -> "filesdb.InfoFid":
 		if fid==0:
-			return make_dict(
+			return self.InfoFid(
 				parent_id=0,
 				name	='',
 				fid		=0,
@@ -1619,12 +1663,15 @@ class filesdb:
 		if tstart is None: tstart = 0
 		if tend is None: tend = time()+100
 
+		count:int
+		count_static:int
+
 		n = self.CUR.execute('SELECT parent_id,name,id,type,modified FROM dirs WHERE id = ?',(fid,)).fetchone()
 		if n is not None:
 			(parent_id,name,fid,typ,modified) = n
 			deleted = False
 			path = self.id2path(fid)
-			ids = self.path2ids(path)
+			ids = cast(List[int], self.path2ids(path))
 
 			if modified!=2:
 				(data, oid) = self.CUR.execute('SELECT data, owner FROM stat WHERE id = ?',(fid,)).fetchone()
@@ -1640,7 +1687,7 @@ class filesdb:
 				else:
 					(oname,save) = (None, True)
 			else:
-				(data, oid, stat, count_static, count, oname, save) = (None, None, None, None, None, None, None)
+				(data, oid, stat, count_static, count, oname, save) = (None, None, None, 0, 0, None, None)
 		else:
 			n = self.CUR.execute('SELECT parent_id,name,id,owner FROM deleted WHERE id = ?',(fid,)).fetchone()
 			if n is None: self.raise_notify(None, f"can't find {fid} in dirs and in deleted")
@@ -1648,7 +1695,7 @@ class filesdb:
 			deleted = True
 			modified = 0
 			path = self.id2path_d(fid)[0]
-			ids = self.path2ids_d(path)[0]
+			ids = cast(List[int], self.path2ids_d(path)[0])
 
 			n = self.CUR.execute('''SELECT data, 
 				st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,
@@ -1672,7 +1719,7 @@ class filesdb:
 				(oname,save) = self.CUR.execute('SELECT name, save FROM owners WHERE id = ?',(oid,)).fetchone()
 			else:
 				(oname,save) = (None, True)
-		return make_dict(
+		return self.InfoFid(
 			parent_id=parent_id,
 			name	=name,
 			fid		=fid,
@@ -1691,7 +1738,7 @@ class filesdb:
 		)
 
 	@staticmethod
-	def format_info(info, *, info_lev=1, path_indent=None, nest_reducer=0, abs_path=None, show_owner=True):
+	def format_info(info : "filesdb.InfoFid", *, info_lev : int=1, path_indent : None|str =None, nest_reducer : int=0, abs_path : None|bool =None, show_owner : bool =True) -> List[str]:
 		'''
 		info_lev=0	права и дату модификации не показывает, показывает полный путь
 		info_lev=1	путь короткий, показывает права и дату модификации
@@ -1699,7 +1746,7 @@ class filesdb:
 		path_indent	несли не None показывает только имя, но перед ним делает отступы в количестве глубины вложенности
 		если abs_path не None - path_indent игнорируется
 		'''
-		out_data = []
+		out_data : List[str] = []
 
 		if abs_path is None:
 			abs_path = info_lev==0
@@ -1757,12 +1804,12 @@ class filesdb:
 			if info.stat is None:
 				out_data.append('????-??-?? ??:??:??.??????')	
 			else:
-				out_data.append(datetime.fromtimestamp(info.stat.st_mtime))
+				out_data.append(str(datetime.fromtimestamp(info.stat.st_mtime)))
 
 		# uid, gid, size
 		if info_lev==2:
 			if info.stat is not None:
-				out_data.append(get_username_by_uid(info.stat.st_uid))
+				out_data.append(get_username_by_uid(info.stat.st_uid) )
 				out_data.append(get_groupname_by_gid(info.stat.st_gid))
 				out_data.append(str(info.stat.st_size))
 			else:
@@ -1791,13 +1838,16 @@ class filesdb:
 
 		return out_data
 
-	def ls(self, fid=None,*,info_lev=1):
-		fid = self.any2id(fid)
+	def ls(self : Self, fid_in : None|str|int =None,*,info_lev : int =1) -> None:
+		fid = self.any2id(fid_in)
 		print(*self.format_info(self.info_fid(fid), info_lev=0),sep='\t')
 		for (fid,) in self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ?',(fid,)).fetchall():
 			print(*self.format_info(self.info_fid(fid), info_lev=info_lev),sep='\t')
 
-	def ls_r(self, fid=None,*,info_lev=1, show_deleted=True, where='all', interval=None):
+	def ls_r(self : Self, fid_in : None|str|int =None,*,
+			info_lev : int =1, show_deleted : bool =True, 
+			where : str|Tuple[List[int],List[int]]|List[int] ='all', interval : None|Tuple[None|float, None|float] =None
+	) -> None:
 		'''
 		where:
 		'all' - всё показывать
@@ -1807,8 +1857,11 @@ class filesdb:
 		(*,*) -> (fids,fidsd)
 		list/set -> fids -> fidsd
 		'''
-		assert where in ['all', 'hist_owner', 'hist_noowner', 'modified']
-		fid = self.any2id(fid)
+		assert where in ['all', 'hist_owner', 'hist_noowner', 'modified'] if type(where) is str else True
+		fids: List[int]|Set[int]
+		fidsd: List[int]|Set[int]
+
+		fid = self.any2id(fid_in)
 		print(*self.format_info(self.info_fid(fid), info_lev=0),sep='\t')
 		nest_reducer = (len(self.path2ids(self.id2path(fid))))
 		if where=='hist_owner': 
@@ -1822,13 +1875,13 @@ class filesdb:
 			if show_deleted: fidsd = set()
 		if type(where) is tuple:
 			(fids,fidsd) = where
-		if type(where) is list or type(where) is set:
+		if isinstance(where, list) or isinstance(where, set):
 			fids = fidsd = where
 		#print(fids)
 		#print(fidsd)
 
 		count = 0
-		def my_walk(did,parents):
+		def my_walk(did : int, parents : List[int]):
 			nonlocal count
 			printed = False
 			if True:
@@ -1875,7 +1928,7 @@ class filesdb:
 		my_walk(fid,[])
 		print('total objects number:',count)
 
-	def list_owners(self, path=None, show_deleted=True, owner=None):
+	def list_owners(self : Self, path : None|str =None, show_deleted : bool =True, owner=None) -> None:
 		# todo если задан owner - показывает только его
 		# выводить только если owner и owner родителя не совпадают
 		# deleted - с пометками
@@ -1886,11 +1939,12 @@ class filesdb:
 			return
 		path = os.path.abspath(path)
 		# format: save owner fid deleted path
-		(fid,deleted) = self.path2ids_d(path,self.CUR)
-		fid = fid[-1]
+		(fids,deleted) = self.path2ids_d(path,self.CUR)
+		fid = fids[-1]
 		if fid is None:
 			self.raise_notify(None, 'path does not exist')
-		def my_walk(did,deleted,downer,depth):
+		assert fid is not None
+		def my_walk(did : int , deleted : bool , downer : int|None, depth : int) -> None:
 			nonlocal count
 			if not deleted:
 				for (owner, fid) in self.CUR.execute(
@@ -1912,12 +1966,12 @@ class filesdb:
 			my_walk(fid,deleted,info.oid,0)
 		print('total objects number:',count)
 
-	def unused_owners(self):
+	def unused_owners(self : Self) -> None:
 		for (oid, oname) in self.CUR.execute('''SELECT owners.id, owners.name  FROM owners WHERE owners.id NOT IN 
 				(SELECT stat.owner AS id FROM stat WHERE stat.owner NOT NULL /*UNION SELECT deleted.owner AS id FROM deleted WHERE deleted.owner NOT NULL*/)'''):
 			print(oid, oname, sep='\t')
 
-	def all_info(self, interval=None, show_deleted=True):
+	def all_info(self : Self, interval : None|Tuple[None|float, None|float] =None, show_deleted : bool=True):
 		print('----- modified with no owner ----')
 		for path in self.ROOT_DIRS:
 			self.ls_r(path,info_lev=1, show_deleted=True, where='hist_noowner')
@@ -1929,15 +1983,16 @@ class filesdb:
 		print('----- unused owners ----')
 		self.unused_owners()
 
-	def hist_id(self, fid):
+	def hist_id(self : Self, fid : int) -> None:
 		print(self.id2path_d(fid,self.CUR))
-		with closing(self.CON.execute('SELECT * FROM dirs WHERE id = ?',(fid,))) as cursor:
-			list(self.print_fid(cursor))
+		# todo
+		#with closing(self.CON.execute('SELECT * FROM dirs WHERE id = ?',(fid,))) as cursor:
+		#	list(self.print_fid(cursor))
 		for (parent_id, name, typ, etyp, data, time, static_found) in \
 			self.CUR.execute('SELECT parent_id, name, type, event_type, data, time, static_found FROM hist WHERE id = ? ORDER BY time DESC',(fid,)).fetchall():
 				if etyp==ECREAT: etyp = 'C'
 				elif etyp==EDEL: etyp = 'D'
-				elif etyp==EMOVE: etyp = 'V'
+				elif etyp==EMOVE: etyp= 'V'
 				elif etyp==EMODIF:etyp= 'M'
 				else: assert False, etyp
 				if etyp=='V':
@@ -1950,11 +2005,11 @@ class filesdb:
 	# инициализация приложения/библиотеки
 	# ------------------------------------
 
-	def read_root_dirs(self):
+	def read_root_dirs(self : Self) -> List[str]:
 		'''из базы данных считывает, какие папки отмечены для слежения'''
 		with self.CON:
 			root_dirs = []
-			def walk(did,path):
+			def walk(did : int, path : str) -> None:
 				n = self.CUR.execute('SELECT id, name, modified FROM dirs WHERE parent_id = ?',(did,)).fetchall()
 				for (fid, name, modified) in n:
 					if modified==2:
@@ -1965,7 +2020,7 @@ class filesdb:
 			return root_dirs
 
 	@staticmethod
-	def get_root_dirs():
+	def get_root_dirs() -> List[str]:
 		'''определяет, за какими папками надо на самом деле следить, если указано следить за всей файловой системой'''
 		if os.name=='nt': return ['C:\\']
 		dirs = []
@@ -1977,8 +2032,21 @@ class filesdb:
 				dirs.append('/'+rd)
 		return dirs
 
-	def __init__(self, files_db, root_dirs = None, nohash = False, nocheck=False, server_in=None):
-		'''инициализирует FILES_DB, ROOT_DIRS; открывает сединение CON, CUR (по умолчанию только для чтения)'''
+	def __init__(self : Self, files_db : str, root_dirs : Optional[List[str]|str] = None, nohash : bool = False, nocheck : bool =False, server_in : Optional[str] =None) -> None:
+		'''
+		инициализирует FILES_DB, ROOT_DIRS; открывает сединение CON, CUR (по умолчанию только для чтения)
+		files_db - имя файла базы данных
+		root_dirs - если задан - пытается создать базу данных с этими наблюдаемыми директориями, 
+			иначе self.ROOT_DIRS ссчитывает из базы данных
+		nohash - не вычислять хэши при инициализации
+		nocheck - не проверять целостность БД
+		режим сервера:
+			может принимать команды через stdin
+		режим клиента
+			может читать БД
+			для записи в БД отправляет команды на сервер
+			server_in - имя UNIX сокета или FIFO чтобы отправлять управляющие команды
+		'''
 		try:
 			self.CON.cursor().close()
 		except Exception as ex:
@@ -1988,11 +2056,12 @@ class filesdb:
 			#raise Exception('close existing connection before opening new one')
 
 		ro = server_in is not None
-		self.server_in = None
+		self.server_in : Optional[TextIO] = None
 		if server_in is not None:
 			if STAT.S_ISSOCK(os.stat(server_in).st_mode):
-				self.server_in = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-				self.server_in.connect(server_in)
+				sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) # type: ignore[attr-defined]
+				sock.connect(server_in)
+				self.server_in = sock.makefile('w',encoding='utf-8')
 			else:
 				self.server_in = open(server_in, "w")
 
@@ -2023,6 +2092,7 @@ class filesdb:
 			if root_dirs==['/']:
 				root_dirs = self.get_root_dirs()
 				print('root_dirs:',root_dirs)
+			assert isinstance(root_dirs,list)
 			root_dirs = [os.path.abspath(x) for x in root_dirs]
 			self.FILES_DB = files_db
 			self.CON = sqlite3.connect(self.FILES_DB)
@@ -2036,7 +2106,7 @@ class filesdb:
 				self.CON.close()
 				self.CON = sqlite3.connect('files:'+self.FILES_DB+'?mode=ro', uri=True)
 
-	def __del__(self):
+	def __del__(self : Self) -> None:
 		self.CON.close()
 		if self.server_in is not None:
 			self.server_in.close()
@@ -2045,7 +2115,7 @@ class filesdb:
 		if self.commit_thr is not None and self.commit_thr.is_alive():
 			self.notify(1.5,f'filesdb({repr(self.FILES_DB)}): lost running commit thread')
 
-	def execute(self,*args,**kwargs):
+	def execute(self : Self,*args,**kwargs) -> sqlite3.Cursor:
 		with self.CON:
 			return self.CUR.execute(*args,**kwargs)
 
@@ -2057,14 +2127,15 @@ if __name__ == "__main__":
 		exit(0)
 
 	import sys
+	nohash : bool
 	if sys.argv[1]=='--nohash':
 		nohash = True
 		del sys.argv[1]
 	else:
 		nohash = False
 
-	root_dirs = sys.argv[2:]
-	if len(root_dirs)==0: root_dirs = None
+	root_dirs : Optional[List[str]] = sys.argv[2:]
+	if root_dirs is None or len(root_dirs)==0: root_dirs = None
 	print(sys.argv[1],root_dirs,nohash)
 	fdb = filesdb(sys.argv[1],root_dirs,nohash)
 	fdb.watch()
