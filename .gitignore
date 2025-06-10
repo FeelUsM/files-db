@@ -1,6 +1,7 @@
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
 *.log
 .ipynb_checkpoints
 __pycache__

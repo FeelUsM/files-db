@@ -297,7 +297,7 @@ class filesdb:
 			self.CUR.execute('CREATE INDEX id_dirs ON dirs (id)')
 			self.CUR.execute('CREATE INDEX parname_dirs ON dirs (parent_id, name)')	
 
-			self.CUR.execute(''' CREATE TABLE stat  (
+			self.CUR.execute('''CREATE TABLE stat  (
 				id         INTEGER PRIMARY KEY,
 				type       INTEGER NOT NULL,
 				
@@ -325,8 +325,7 @@ class filesdb:
 			# можно было бы использовать hist для этих целей, но там каждый файл не в единственном экземпляре,
 			# и особенно, если мы не хотим сохранять события о файле, а он постоянно удаляется и создаётся
 			# todo добавить время удаления, чтобы можно было удалять инфу об очень давно удалённых файлах
-			self.CUR.execute('''
-			CREATE TABLE deleted  (
+			self.CUR.execute('''CREATE TABLE deleted  (
 				parent_id INTEGER NOT NULL, /* старая запись из dirs */
 				name      TEXT    NOT NULL, /* старая запись из dirs */
 				id        INTEGER NOT NULL, /* старая запись из dirs */
@@ -338,8 +337,7 @@ class filesdb:
 			self.CUR.execute('CREATE INDEX id_deleted ON deleted (id)')
 			self.CUR.execute('CREATE INDEX parname_deleted ON deleted (parent_id,name)')
 
-			self.CUR.execute('''
-			CREATE TABLE hist(
+			self.CUR.execute('''CREATE TABLE hist(
 				parent_id    INTEGER NOT NULL, /* старая запись из dirs */
 				name         TEXT    NOT NULL, /* старая запись из dirs */
 				id           INTEGER NOT NULL, /* на id может быть несколько записей */
@@ -649,7 +647,7 @@ class filesdb:
 					for name in dirs+files:
 						try:
 							name.encode("utf8", errors="surrogateescape")
-						except Exception as e:
+						except Exception:
 							print(root,repr(name))
 							continue
 
@@ -1426,7 +1424,6 @@ class filesdb:
 		from watchdog.observers import Observer
 		import threading
 		from queue import Queue
-		from time import time, sleep
 		import sys
 
 		self.check_integrity()
@@ -1610,17 +1607,17 @@ class filesdb:
 				parent_id: int,
 				name	:str,
 				fid		:int,
-				typ		:int,
-				modified:int,
+				typ		:int, # MFILE/MDIR/MLINK/MOTHER
+				modified:int, # 0 нет, 1 да, 2 это pre-root-dir
 				deleted	:int|bool,
 				path	:str,
-				ids		:List[int],
-				data	:str|None,
+				ids		:List[int], # path в формате списка id-ов
+				data	:str|None, # hash/link
 				stat	:os.stat_result|None,
-				count_static:int,
-				count	:int,
-				oname	:str|None,
-				save	:bool,
+				count_static:int, # количество изменений, найденных статически
+				count	:int, # количество изменений этого файла за указанный интервал
+				oname	:str|None, # имя владельца
+				save	:bool, # сохраняем или игнорируем события связанные с этим файлом
 				oid		:int|None)->None:
 			self.parent_id: int = parent_id
 			self.name	:str = name
@@ -1639,6 +1636,9 @@ class filesdb:
 			self.oid	:int|None = oid
 
 	def info_fid(self : Self, fid : int, *, interval : None|Tuple[None|float, None|float] =None) -> "filesdb.InfoFid":
+		'''
+		возращает инфу об одном файле, подсчитывает количество упоминаний в истории за заданный промежуток времени
+		'''
 		if fid==0:
 			return self.InfoFid(
 				parent_id=0,
@@ -1662,7 +1662,7 @@ class filesdb:
 		else:
 			tstart,tend = interval
 		if tstart is None: tstart = 0
-		if tend is None: tend = time()+100
+		if tend is None: tend = time()+1000
 
 		count:int
 		count_static:int
@@ -1674,7 +1674,7 @@ class filesdb:
 			path = self.id2path(fid)
 			ids = cast(List[int], self.path2ids(path))
 
-			if modified!=2:
+			if modified!=2: # pre-root-dir
 				(data, oid) = self.CUR.execute('SELECT data, owner FROM stat WHERE id = ?',(fid,)).fetchone()
 				stat = self.get_stat(fid)
 
@@ -1744,7 +1744,7 @@ class filesdb:
 		info_lev=0	права и дату модификации не показывает, показывает полный путь
 		info_lev=1	путь короткий, показывает права и дату модификации
 		info_lev=2	путь короткий, показывает права и дату модификации и uid, gid, size, data
-		path_indent	несли не None показывает только имя, но перед ним делает отступы в количестве глубины вложенности
+		path_indent	если не None показывает только имя, но перед ним делает отступы в количестве глубины вложенности
 		если abs_path не None - path_indent игнорируется
 		'''
 		out_data : List[str] = []
@@ -1840,6 +1840,9 @@ class filesdb:
 		return out_data
 
 	def ls(self : Self, fid_in : None|str|int =None,*,info_lev : int =1) -> None:
+		'''
+		показывает папку и её содержимое
+		'''
 		fid = self.any2id(fid_in)
 		print(*self.format_info(self.info_fid(fid), info_lev=0),sep='\t')
 		for (fid,) in self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ?',(fid,)).fetchall():
@@ -1866,11 +1869,11 @@ class filesdb:
 		print(*self.format_info(self.info_fid(fid), info_lev=0),sep='\t')
 		nest_reducer = (len(self.path2ids(self.id2path(fid))))
 		if where=='hist_owner': 
-			fids                   = set(self.CUR.execute('SELECT stat.id FROM stat JOIN hist ON stat.id==hist.id WHERE stat.owner NOT NULL').fetchall())
-			if show_deleted: fidsd = set(self.CUR.execute('SELECT  deleted.id FROM deleted  JOIN hist ON deleted.id ==hist.id WHERE deleted.owner  NOT NULL').fetchall())
+			fids                   = set(self.CUR.execute('SELECT stat.id    FROM stat    JOIN hist ON stat.id   ==hist.id WHERE stat.owner    NOT NULL').fetchall())
+			if show_deleted: fidsd = set(self.CUR.execute('SELECT deleted.id FROM deleted JOIN hist ON deleted.id==hist.id WHERE deleted.owner NOT NULL').fetchall())
 		if where=='hist_noowner': 
-			fids                   = set(self.CUR.execute('SELECT stat.id FROM stat JOIN hist ON stat.id==hist.id WHERE stat.owner IS NULL').fetchall())
-			if show_deleted: fidsd = set(self.CUR.execute('SELECT  deleted.id FROM deleted  JOIN hist ON deleted.id ==hist.id WHERE deleted.owner  IS NULL').fetchall())
+			fids                   = set(self.CUR.execute('SELECT stat.id    FROM stat    JOIN hist ON stat.id   ==hist.id WHERE stat.owner    IS NULL').fetchall())
+			if show_deleted: fidsd = set(self.CUR.execute('SELECT deleted.id FROM deleted JOIN hist ON deleted.id==hist.id WHERE deleted.owner IS NULL').fetchall())
 		if where=='modified': 
 			fids                   = set(self.CUR.execute('SELECT id FROM dirs WHERE modified>0').fetchall())
 			if show_deleted: fidsd = set()
@@ -1892,7 +1895,7 @@ class filesdb:
 						if interval is None or info.count>0:
 							printed = True
 							count+=1
-							for pid in parents: # вывод ненвыведенных парентов
+							for pid in parents: # вывод невыведенных парентов
 								print(*self.format_info(self.info_fid(pid,interval=interval), info_lev=info_lev, path_indent='  ', nest_reducer=nest_reducer),sep='\t')
 							parents = []
 							print(*self.format_info(info, info_lev=info_lev, path_indent='  ', nest_reducer=nest_reducer),sep='\t')
@@ -1975,7 +1978,7 @@ class filesdb:
 	def all_info(self : Self, interval : None|Tuple[None|float, None|float] =None, show_deleted : bool=True):
 		print('----- modified with no owner ----')
 		for path in self.ROOT_DIRS:
-			self.ls_r(path,info_lev=1, show_deleted=True, where='hist_noowner')
+			self.ls_r(path,info_lev=1, show_deleted=True, where='hist_noowner',interval=interval)
 		print('----- modified with owner ----')
 		for path in self.ROOT_DIRS:
 			self.ls_r(path,info_lev=1, show_deleted=True, where='hist_owner',interval=interval)
@@ -1989,7 +1992,7 @@ class filesdb:
 		# todo
 		#with closing(self.CON.execute('SELECT * FROM dirs WHERE id = ?',(fid,))) as cursor:
 		#	list(self.print_fid(cursor))
-		for (parent_id, name, typ, etyp, data, time, static_found) in \
+		for (parent_id, name, typ, etyp, data, _time, static_found) in \
 			self.CUR.execute('SELECT parent_id, name, type, event_type, data, time, static_found FROM hist WHERE id = ? ORDER BY time DESC',(fid,)).fetchall():
 				if etyp==ECREAT: etyp = 'C'
 				elif etyp==EDEL: etyp = 'D'
@@ -1997,10 +2000,10 @@ class filesdb:
 				elif etyp==EMODIF:etyp= 'M'
 				else: assert False, etyp
 				if etyp=='V':
-					print(etyp+' '+('S' if static_found else 'W')+' '+str(datetime.fromtimestamp(time)),
+					print(etyp+' '+('S' if static_found else 'W')+' '+str(datetime.fromtimestamp(_time)),
 						 self.id2path_d(parent_id,self.CUR)[0]+os.sep+name)
 				else:
-					print(etyp+' '+('S' if static_found else 'W')+' '+str(datetime.fromtimestamp(time)))
+					print(etyp+' '+('S' if static_found else 'W')+' '+str(datetime.fromtimestamp(_time)))
 
 	# ------------------------------------
 	# инициализация приложения/библиотеки
@@ -2050,7 +2053,7 @@ class filesdb:
 		'''
 		try:
 			self.CON.cursor().close()
-		except Exception as ex:
+		except Exception:
 			pass
 		else:
 			self.CON.close()
