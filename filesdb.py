@@ -229,7 +229,8 @@ class filesdb:
 							title = 'filesdb:'
 							# Получаем DBUS_SESSION_BUS_ADDRESS
 							dbus_address = subprocess.check_output(
-								f"grep -z DBUS_SESSION_BUS_ADDRESS /proc/$(pgrep -u {username} gnome-session | head -n1)/environ | tr '\\0' '\\n' | sed 's/DBUS_SESSION_BUS_ADDRESS=//'",
+								f"grep -z DBUS_SESSION_BUS_ADDRESS /proc/$(pgrep -u {username} plasmashell | head -1)/environ | tr '\\0' '\\n' | sed 's/DBUS_SESSION_BUS_ADDRESS=//'",
+								#f"grep -z DBUS_SESSION_BUS_ADDRESS /proc/$(pgrep -u {username} gnome-session | head -n1)/environ | tr '\\0' '\\n' | sed 's/DBUS_SESSION_BUS_ADDRESS=//'",
 								shell=True, text=True
 							).strip()
 							# Отправляем уведомление через sudo
@@ -968,7 +969,7 @@ class filesdb:
 								lhsh = None
 						elif ftype==MDIR:
 							if with_all or modified!=0:
-								lhsh = my_walk(fid,modified==2)
+								lhsh = str(my_walk(fid,modified==2))
 							else:
 								(lhsh,) = cursor.execute('SELECT data FROM stat WHERE id = ?',(fid,)).fetchone()
 						elif ftype==MOTHER:
@@ -1086,7 +1087,7 @@ class filesdb:
 		if ids is None:
 			ids = self.path2ids(path,cursor)
 			
-		# рассчитываем, что src_path - обсолютный путь, не симлинк, не содержит // типа '/a//b/c'
+		# рассчитываем, что src_path - абсолютный путь, не симлинк, не содержит // типа '/a//b/c'
 		pathl = path.split(os.sep)
 
 		fid = ids[-2]
@@ -1099,7 +1100,7 @@ class filesdb:
 			assert simple_type(lstat.st_mode)==MDIR, simple_type(lstat.st_mode)
 			fid = self.create(fid, name, lstat, True, cursor, owner, save)
 
-		return fid, path[-1], owner, save
+		return fid, pathl[-1], owner, save
 
 	def create1(self : Self, ids : List[None|int], src_path : str, stat : os.stat_result, is_directory : bool, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		if cursor is None: cursor = self.CUR
@@ -1452,14 +1453,14 @@ class filesdb:
 		def my_event_handler(event: FileSystemEvent) -> None:
 			assert isinstance(event.src_path, str)
 			assert isinstance(event.dest_path, str)
-			if event.event_type=='closed_no_write':
+			if event.event_type=='event closed_no_write':
 				self.notify(1.5, 'pass closed_no_write',event.src_path)
 				pass
 			elif event.event_type=='opened':
-				self.notify(1.5, 'pass opened',event.src_path)
+				self.notify(1.5, 'event pass opened',event.src_path)
 				pass
 			elif event.event_type=='modified' or event.event_type=='closed':
-				self.notify(1.5, 'modified',event.src_path)
+				self.notify(1.5, 'event modified',event.src_path)
 				try:
 					stat = os_stat(event.src_path)
 				except FileNotFoundError as e:
@@ -1468,7 +1469,7 @@ class filesdb:
 					self.modified(event.src_path, stat, event.is_directory, event.is_synthetic, self.CUR)
 				
 			elif event.event_type=='created':
-				self.notify(1.5, 'created',event.src_path)
+				self.notify(1.5, 'event created',event.src_path)
 				try:
 					stat = os_stat(event.src_path)
 				except FileNotFoundError as e:
@@ -1476,10 +1477,10 @@ class filesdb:
 				else:
 					self.created(event.src_path, stat, event.is_directory, event.is_synthetic, self.CUR)
 			elif event.event_type=='deleted':
-				self.notify(1.5, 'deleted',event.src_path)
+				self.notify(1.5, 'event deleted',event.src_path)
 				self.deleted(event.src_path, event.is_directory, event.is_synthetic, self.CUR)
 			elif event.event_type=='moved':
-				self.notify(1.5, 'moved',event.src_path,event.dest_path)
+				self.notify(1.5, 'event moved',event.src_path,event.dest_path)
 				try:
 					stat = os_stat(event.dest_path)
 				except FileNotFoundError as e:
@@ -1488,7 +1489,7 @@ class filesdb:
 				else:
 					self.moved(event.src_path, event.dest_path, stat, event.is_directory, event.is_synthetic, self.CUR)
 			else:
-				self.raise_notify(None,event)
+				self.raise_notify(None,'event '+repr(event))
 
 		q : Queue = Queue()
 
