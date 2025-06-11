@@ -831,7 +831,7 @@ class filesdb:
 		
 	def create(self : Self, parent_id : int, name : str, stat : os.stat_result, static_found : bool|int, cursor : Optional[sqlite3.Cursor] =None, 
 			owner : Optional[int]=None, save : Optional[bool]=None
-	) -> None:
+	) -> int:
 		'''
 		создается объект, родительская директория которого уже существует
 		save, owner определяются родительской папкой или из таблицы deleted
@@ -913,14 +913,15 @@ class filesdb:
 		# todo calc only unknown hashes
 		with self.CON:
 			with closing(self.CON.cursor()) as cursor:
+				ids:List[Tuple[int]]
 				if with_all:
 					ids = cursor.execute('SELECT id FROM dirs WHERE type = ?',(MFILE,)).fetchall()
 				else:
 					ids = cursor.execute('SELECT id FROM dirs WHERE type = ? AND modified = 1',(MFILE,)).fetchall()
 				cnt = 0
 				print('calc hashes:')
-				for fid in (tqdm(ids) if __name__!="__main__" else ids):
-					fid = fid[0]
+				for fid1 in (tqdm(ids) if __name__!="__main__" else ids):
+					fid = fid1[0]
 					path = None
 					try:
 						path = external_path(self.id2path(fid,cursor))
@@ -1602,6 +1603,16 @@ class filesdb:
 	# мониторинговые функции
 	# --------------------------------
 
+	@staticmethod
+	def _unpack_interval(interval):
+		if interval is None:
+			tstart,tend = None, None
+		else:
+			tstart,tend = interval
+		if tstart is None: tstart = 0
+		if tend is None: tend = time()+1000
+		return tstart,tend
+
 	class InfoFid:
 		def __init__(self,
 				parent_id: int,
@@ -1616,6 +1627,7 @@ class filesdb:
 				stat	:os.stat_result|None,
 				count_static:int, # количество изменений, найденных статически
 				count	:int, # количество изменений этого файла за указанный интервал
+				count_all : int, # количество изменений за всё время
 				oname	:str|None, # имя владельца
 				save	:bool, # сохраняем или игнорируем события связанные с этим файлом
 				oid		:int|None)->None:
@@ -1631,6 +1643,7 @@ class filesdb:
 			self.stat	:os.stat_result|None = stat
 			self.count_static:int = count_static
 			self.count	:int = count
+			self.count_all :int = count_all
 			self.oname	:str|None = oname
 			self.save	:bool = save
 			self.oid	:int|None = oid
@@ -1653,19 +1666,16 @@ class filesdb:
 				stat	=None,
 				count_static=0,
 				count	=0,
+				count_all=0,
 				oname	=None,
 				save	=True,
 				oid		=None,
 			)
-		if interval is None:
-			tstart,tend = None, None
-		else:
-			tstart,tend = interval
-		if tstart is None: tstart = 0
-		if tend is None: tend = time()+1000
+		tstart,tend = self._unpack_interval(interval)
 
 		count:int
 		count_static:int
+		count_all : int
 
 		n = self.CUR.execute('SELECT parent_id,name,id,type,modified FROM dirs WHERE id = ?',(fid,)).fetchone()
 		if n is not None:
@@ -1678,17 +1688,19 @@ class filesdb:
 				(data, oid) = self.CUR.execute('SELECT data, owner FROM stat WHERE id = ?',(fid,)).fetchone()
 				stat = self.get_stat(fid)
 
-				nn = self.CON.execute(
-					'SELECT COUNT(*), SUM(CASE WHEN static_found>0 THEN 1 ELSE 0 END) FROM hist WHERE id==? AND ?<=time AND time<=? GROUP BY id '
+				nn = self.CUR.execute(
+					'SELECT COUNT(*), SUM(CASE WHEN static_found>0 THEN 1 ELSE 0 END) FROM hist WHERE id==? AND ?<=time AND time<=?'
 					,(fid,tstart,tend)).fetchone()
 				count, count_static = nn if nn is not None else (0, 0)
+				nn = self.CUR.execute('SELECT COUNT(*) FROM hist WHERE id==?',(fid, )).fetchone()
+				count_all = nn[0] if nn is not None else 0
 
 				if oid is not None:
 					(oname,save) = self.CUR.execute('SELECT name, save FROM owners WHERE id = ?',(oid,)).fetchone()
 				else:
 					(oname,save) = (None, True)
 			else:
-				(data, oid, stat, count_static, count, oname, save) = (None, None, None, 0, 0, None, None)
+				(data, oid, stat, count_static, count, count_all, oname, save) = (None, None, None, 0, 0, 0, None, None)
 		else:
 			n = self.CUR.execute('SELECT parent_id,name,id,owner FROM deleted WHERE id = ?',(fid,)).fetchone()
 			if n is None: self.raise_notify(None, f"can't find {fid} in dirs and in deleted")
@@ -1713,8 +1725,10 @@ class filesdb:
 				stat = None
 				typ = None
 
-			nn = self.CON.execute('SELECT COUNT(*), SUM(CASE WHEN static_found>0 THEN 1 ELSE 0 END) FROM hist WHERE id==? AND ?<=time AND time<=? GROUP BY id ',(fid,tstart,tend)).fetchone()
+			nn = self.CUR.execute('SELECT COUNT(*), SUM(CASE WHEN static_found>0 THEN 1 ELSE 0 END) FROM hist WHERE id==? AND ?<=time AND time<=?',(fid,tstart,tend)).fetchone()
 			count, count_static = nn if nn is not None else (0, 0)
+			nn = self.CUR.execute('SELECT COUNT(*) FROM hist WHERE id==?',(fid,)).fetchone()
+			count_all = nn[0] if nn is not None else 0
 
 			if oid is not None:
 				(oname,save) = self.CUR.execute('SELECT name, save FROM owners WHERE id = ?',(oid,)).fetchone()
@@ -1733,6 +1747,7 @@ class filesdb:
 			stat	=stat,
 			count_static=count_static,
 			count	=count,
+			count_all=count_all,
 			oname	=oname,
 			save	=save,
 			oid		=oid,
@@ -1864,18 +1879,24 @@ class filesdb:
 		assert where in ['all', 'hist_owner', 'hist_noowner', 'modified'] if type(where) is str else True
 		fids: List[int]|Set[int]
 		fidsd: List[int]|Set[int]
+		tstart,tend = self._unpack_interval(interval)
 
 		fid = self.any2id(fid_in)
 		print(*self.format_info(self.info_fid(fid), info_lev=0),sep='\t')
 		nest_reducer = (len(self.path2ids(self.id2path(fid))))
 		if where=='hist_owner': 
-			fids                   = set(self.CUR.execute('SELECT stat.id    FROM stat    JOIN hist ON stat.id   ==hist.id WHERE stat.owner    NOT NULL').fetchall())
-			if show_deleted: fidsd = set(self.CUR.execute('SELECT deleted.id FROM deleted JOIN hist ON deleted.id==hist.id WHERE deleted.owner NOT NULL').fetchall())
+			fids                   = set(self.CUR.execute(
+				'SELECT stat.id    FROM stat    JOIN hist ON stat.id   ==hist.id WHERE stat.owner    NOT NULL AND ?<=hist.time AND hist.time<=?',(tstart,tend)).fetchall())
+			if show_deleted: fidsd = set(self.CUR.execute(
+				'SELECT deleted.id FROM deleted JOIN hist ON deleted.id==hist.id WHERE deleted.owner NOT NULL AND ?<=hist.time AND hist.time<=?',(tstart,tend)).fetchall())
 		if where=='hist_noowner': 
-			fids                   = set(self.CUR.execute('SELECT stat.id    FROM stat    JOIN hist ON stat.id   ==hist.id WHERE stat.owner    IS NULL').fetchall())
-			if show_deleted: fidsd = set(self.CUR.execute('SELECT deleted.id FROM deleted JOIN hist ON deleted.id==hist.id WHERE deleted.owner IS NULL').fetchall())
+			fids                   = set(self.CUR.execute(
+				'SELECT stat.id    FROM stat    JOIN hist ON stat.id   ==hist.id WHERE stat.owner    IS NULL AND ?<=hist.time AND hist.time<=?',(tstart,tend)).fetchall())
+			if show_deleted: fidsd = set(self.CUR.execute(
+				'SELECT deleted.id FROM deleted JOIN hist ON deleted.id==hist.id WHERE deleted.owner IS NULL AND ?<=hist.time AND hist.time<=?',(tstart,tend)).fetchall())
 		if where=='modified': 
-			fids                   = set(self.CUR.execute('SELECT id FROM dirs WHERE modified>0').fetchall())
+			fids                   = set(self.CUR.execute(
+				'SELECT dirs.id    FROM dirs    JOIN hist ON dirs.id   ==hist.id WHERE dirs.modified  >0     AND ?<=hist.time AND hist.time<=?',(tstart,tend)).fetchall())
 			if show_deleted: fidsd = set()
 		if type(where) is tuple:
 			(fids,fidsd) = where
@@ -1930,7 +1951,7 @@ class filesdb:
 							parents = []
 			return printed
 		my_walk(fid,[])
-		print('total objects number:',count)
+		print('total objects number:',count)#, 'checked objects:',len(fids),'+',len(fidsd))
 
 	def list_owners(self : Self, path : None|str =None, show_deleted : bool =True, owner=None) -> None:
 		# todo если задан owner - показывает только его
