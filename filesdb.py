@@ -1088,7 +1088,7 @@ class filesdb:
 			
 		# рассчитываем, что src_path - абсолютный путь, не симлинк, не содержит // типа '/a//b/c'
 		pathl = path.split(os.sep)
-
+		assert ids[-1] is None
 		fid = ids[-2]
 		(owner,save) = self.owner_save(fid,cursor)
 
@@ -1121,7 +1121,61 @@ class filesdb:
 					cursor.execute('SELECT id FROM dirs WHERE parent_id=? AND name=?',(nfid,name)).fetchone()[0],
 					cursor)
 			else:
+				self.notify(0, 'MOVE_DELETED',ofid,nfid,name,fid)
 				cursor.execute('UPDATE deleted SET parent_id=? WHERE id = ?',(nfid,fid))
+				# зафиксирован непонятный баг
+				#2025-06-11 21:34:26.826996 M 909790 - /home/feelus/snap/obsidian/47/.config/obsidian/WebStorage/QuotaManager-journal
+				#2025-06-11 21:34:26.916598 M 909791 - /home/feelus/snap/obsidian/47/.config/obsidian/WebStorage/QuotaManager
+				#2025-06-11 21:34:26.918421 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
+				#2025-06-11 21:34:26.920199 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
+				#2025-06-11 21:34:44.570163 M 133195 - /var/lib/PackageKit/transactions.db
+				#2025-06-11 21:34:44.648264 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
+				#2025-06-11 21:34:44.650337 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
+				#2025-06-11 21:38:27.389297 M 909802 - /home/feelus/snap/obsidian/47/.config/obsidian/obsidian.log
+				#2025-06-11 21:38:27.509666 D 909560 - /home/feelus/snap/obsidian/47/.config/obsidian/Cache/Cache_Data/c2953739a8503c0c_0
+				#2025-06-11 21:38:27.510321 C 909560 - /home/feelus/snap/obsidian/47/.config/obsidian/Cache/Cache_Data/c2953739a8503c0c_0
+				#2025-06-11 21:38:27.513013 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
+				#2025-06-11 21:38:27.515749 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
+				#2025-06-11 21:38:27.532425 M 909576 - /home/feelus/snap/obsidian/47/.config/obsidian/Cache/Cache_Data/fc52697cff125bba_0
+				#2025-06-11 21:38:47.658768 M 909620 - /home/feelus/snap/obsidian/47/.config/obsidian/Cache/Cache_Data/index-dir/the-real-index
+				#2025-06-11 21:38:47.738998 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
+				#2025-06-11 21:38:47.741861 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
+				#2025-06-11 21:38:54.810869 M 909790 - /home/feelus/snap/obsidian/47/.config/obsidian/WebStorage/QuotaManager-journal
+				#2025-06-11 21:39:25.765197 M 909790 - /home/feelus/snap/obsidian/47/.config/obsidian/WebStorage/QuotaManager-journal
+				#2025-06-11 21:39:25.841623 M 909791 - /home/feelus/snap/obsidian/47/.config/obsidian/WebStorage/QuotaManager
+				#2025-06-11 21:39:25.844134 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
+				#2025-06-11 21:39:25.846094 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
+				#2025-06-11 21:40:01.222654 M 1184387 - /var/log/sysstat/sa11
+				#2025-06-11 21:40:01.301292 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
+				#2025-06-11 21:40:01.302792 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
+				#2025-06-11 21:43:28.558867 M 900439 - /home/feelus/.local/share/klipper/history2.lst
+				#2025-06-11 21:43:28.642556 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
+				#2025-06-11 21:43:28.644681 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
+				#2025-06-11 21:43:31.881699 C 1221887 - /home/feelus/.local/share/recently-used.xbel.EKGS72
+				#2025-06-11 21:43:31.956905 V 1221887 - /home/feelus/.local/share/recently-used.xbel.EKGS72
+				#2025-06-11 21:43:31.957087 D 1220451 - /home/feelus/.local/share/recently-used.xbel
+				#2025-06-11 21:43:32.598175 M 900444 - /home/feelus/.local/share/kactivitymanagerd/resources/database-wal
+				#Traceback (most recent call last):
+				#  File "/home/feelus/pyfiles/src/filesdb.py", line 1543, in watch
+				#    if isinstance(event,FileSystemEvent):
+				#     ^^^^^^^^^^^^^^^^^^^^^^^
+				#  File "/home/feelus/pyfiles/src/filesdb.py", line 1487, in my_event_handler
+				#    else:
+				#  File "/home/feelus/pyfiles/src/filesdb.py", line 1199, in moved
+				#    return self.created(dest_path, stat, is_directory, is_synthetic, cursor)
+				#    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+				#  File "/home/feelus/pyfiles/src/filesdb.py", line 1143, in move
+				#    cursor.execute('DELETE FROM deleted WHERE parent_id=? AND name=?',(parent_id, name))
+				#    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+				#  File "/home/feelus/pyfiles/src/filesdb.py", line 1123, in move_deleted
+				#    else:
+				#sqlite3.IntegrityError: UNIQUE constraint failed: deleted.parent_id, deleted.name
+				#
+				#The above exception was the direct cause of the following exception:
+				#
+				#Traceback (most recent call last):
+				#  File "/home/feelus/pyfiles/src/filesdb.py", line 2153, in <module>
+				#
 
 	def move(self : Self, fid : int, dest_path : str, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		'''
