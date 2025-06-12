@@ -13,6 +13,25 @@ import socket
 
 from typing import Optional, List, Any, Final, Self, Tuple, TextIO, Callable, cast, Set
 
+#=== on startup ===
+#cd pyfiles/src
+#
+#source ../bin/activate
+#sudo ../bin/jupyter notebook --allow-root
+#
+#source ../bin/activate
+#cat fifo fifo fifo fifo | sudo ../bin/python -u filesdb.py root.db | tee -a root.log 
+## -u     : force the stdout and stderr streams to be unbuffered;
+#
+#
+#sqlite3 files1.db .dump > backup.sql
+#rm files1.db 
+#sqlite3 files1.db < backup.sql
+#
+#mkfifo fifo
+#chmod 777 fifo
+
+
 class AttrDict(dict):
 	def __getattr__(self, key):
 		if key not in self:
@@ -1088,7 +1107,7 @@ class filesdb:
 			
 		# рассчитываем, что src_path - абсолютный путь, не симлинк, не содержит // типа '/a//b/c'
 		pathl = path.split(os.sep)
-		assert ids[-1] is None
+		#assert ids[-1] is None # при вызове из move() это может быть не так
 		fid = ids[-2]
 		(owner,save) = self.owner_save(fid,cursor)
 
