@@ -273,7 +273,7 @@ class filesdb:
 			print('The above exception was the direct cause of the following exception:')
 			print()
 			print("Traceback (most recent call last):")
-			print("".join(format_list(extract_stack()[:-2])), end="")
+			print("".join(format_list(extract_stack()[:-1])), end="")
 			self.notify(0,*args)
 			print("--------------------------")
 		else:
@@ -745,16 +745,21 @@ class filesdb:
 		if type(fid) is str:
 			fid = self.path2ids(normalize_path(fid))[-1]
 			if fid is None: raise Exception('path does not exist')
-		assert type(fid)is int
+		assert type(fid) is int and self.CUR.execute('SELECT id FROM dirs WHERE id==?',(fid,)).fetchone() is not None
 		return fid
-	def any2id_d(self : Self, fid : None|int|str) -> int:
+	def any2id_d(self : Self, fid : None|int|str) -> Tuple[int,bool]:
 		if fid is None:
 			fid = os.getcwd()
 		if type(fid) is str: 
-			fid = self.path2ids_d(os.path.abspath(fid))[0][-1]
-			if fid is None: raise Exception('path does not exist')
-		assert type(fid) is int
-		return fid
+			ids,d = self.path2ids_d(os.path.abspath(fid))
+			if ids[-1] is None: raise Exception('path does not exist')
+			return ids[-1], d
+		else:
+			if self.CUR.execute('SELECT id FROM deleted WHERE id==?',(fid,)).fetchone() is not None:
+				return int(fid), True # int() for mypy
+			else:
+				assert type(fid) is int and self.CUR.execute('SELECT id FROM dirs WHERE id==?',(fid,)).fetchone() is not None
+				return fid, False
 
 	def owner_save(self : Self, fid : int, cursor : Optional[sqlite3.Cursor] =None) -> Tuple[int, bool]:
 		'''
@@ -1262,9 +1267,9 @@ class filesdb:
 		src_path = internal_path(src_path)
 		dest_path = internal_path(dest_path)
 		if is_synthetic:
-			print('synthetic moved', is_directory, datetime.fromtimestamp(time()))
-			print('\t'+src_path)
-			print('\t'+dest_path)
+			#print('synthetic moved', is_directory, datetime.fromtimestamp(time()))
+			#print('\t'+src_path)
+			#print('\t'+dest_path)
 			return
 		ids = self.path2ids(src_path,cursor)
 		if ids[-1] is None:
@@ -1323,11 +1328,12 @@ class filesdb:
 		'''
 		if self.server_in is not None: 
 			self.send2server(inspect.stack()[0][3], name, save)
+			sleep(1)
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
-		with self.CON:
-			self.CUR.execute('''INSERT INTO owners (name, save) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET
-				name = excluded.name,    save = excluded.save ''', (name,save))
-			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
+
+		self.CUR.execute('''INSERT INTO owners (name, save) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET
+			name = excluded.name,    save = excluded.save ''', (name,save))
+		return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 
 	def del_owner(self : Self, owner : str) -> None:
 		'''
@@ -1368,9 +1374,9 @@ class filesdb:
 		'''
 		#todo interval
 		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], fid, interval=interval)
-		fid = self.any2id_d(fid)
+		fid = self.any2id_d(fid)[0]
 		with self.CON:
-			self.CUR.execute('DELETE FROM hist WHERE id = ?)',(fid,))
+			self.CUR.execute('DELETE FROM hist WHERE id = ?',(fid,))
 
 	def del_hist_id_recursive(self : Self, fid : int, interval=None) -> None:
 		'''
@@ -1378,12 +1384,12 @@ class filesdb:
 		'''
 		#todo interval
 		if self.server_in is not None: return self.send2server(inspect.stack()[0][3], fid, interval=interval)
-		fid = self.any2id_d(fid)
+		fid = self.any2id_d(fid)[0]
 		with self.CON:
-			self.CUR.execute('DELETE FROM hist WHERE id = ?)',(fid,))
+			self.CUR.execute('DELETE FROM hist WHERE id = ?',(fid,))
 			fids = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? JOIN SELECT id FROM deleted  WHERE parent_id = ?',(fid,fid)).fetchall()
 			while len(fids)>0:
-				self.CUR.executemany('DELETE FROM hist WHERE id = ?)',fids)
+				self.CUR.executemany('DELETE FROM hist WHERE id = ?',fids)
 				fids2 = []
 				for (fid,) in fids:
 					fids2+= self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ?',(fid,)).fetchall()
@@ -1406,17 +1412,24 @@ class filesdb:
 		in_deleted - устанавливать ли owner-а для удалённых объектов
 		возвращает fid файла
 		'''
-		if self.server_in is not None: self.send2server(inspect.stack()[0][3], path, owner, replace_inner=replace_inner, in_deleted=in_deleted); return self.any2id_d(path)
+		if self.server_in is not None: self.send2server(inspect.stack()[0][3], path, owner, replace_inner=replace_inner, in_deleted=in_deleted); return self.any2id_d(path)[0]
 		with self.CON:
 			with closing(self.CON.cursor()) as cursor:
 				# oid - owner-id, который будем устанавливать
 				if owner is not None:
-					(oid,) = cursor.execute('SELECT id FROM owners WHERE name = ?',(owner,)).fetchone()
+					try:
+						(oid,) = cursor.execute('SELECT id FROM owners WHERE name = ?',(owner,)).fetchone()
+					except TypeError:
+						print('set_owner: cannot find owner:',repr(owner))
+						raise
 				else:
 					oid = None
 
-				fid = self.any2id_d(path)
-				(oldoid,) = cursor.execute('SELECT owner FROM stat WHERE id = ?',(fid,)).fetchone()
+				fid,d = self.any2id_d(path)
+				if not d:
+					(oldoid,) = cursor.execute('SELECT owner FROM stat WHERE id = ?',(fid,)).fetchone()
+				else:
+					(oldoid,) = cursor.execute('SELECT owner FROM deleted WHERE id = ?',(fid,)).fetchone()
 				cursor.execute('UPDATE stat SET owner = ? WHERE id = ?',(oid,fid))
 
 				def my_walk(did : int) -> None:
@@ -1634,6 +1647,7 @@ class filesdb:
 							eventmes = event
 							print('got: ', repr(eventmes))
 							event = yaml.safe_load('['+event+']')
+							#print('parsed:',event)
 						except yaml.YAMLError as e:
 							print(e)
 						else:
@@ -1648,7 +1662,7 @@ class filesdb:
 								print('-----------------------')
 							except Exception as e:
 								self.raise_notify(e,'type: "help, []" for more information about syntax')
-								print('got: ', repr(eventmes))
+								print('got_: ', repr(eventmes))
 							if self.CON.in_transaction:
 								print('COMMIT after command')
 								self.CUR.execute('COMMIT')
