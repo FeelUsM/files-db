@@ -10,6 +10,7 @@ import inspect
 import subprocess
 import yaml
 import socket
+from pprint import pprint
 
 from typing import Optional, List, Any, Final, Self, Tuple, TextIO, Callable, cast, Set
 
@@ -1137,69 +1138,18 @@ class filesdb:
 		а если происходит коллизия по имени с dirs - удаляет его и применяется рекурсивно
 		'''
 		if cursor is None: cursor = self.CUR
-		forbidden_names = set(cursor.execute('SELECT name FROM dirs WHERE parent_id = ?',(nfid,)).fetchall())
+		forbidden_names = set(cursor.execute(
+			'SELECT name FROM dirs WHERE parent_id = ? UNION SELECT name FROM deleted WHERE parent_id = ?',(nfid,nfid)).fetchall())
 		for (name,fid) in cursor.execute('SELECT name, id FROM deleted WHERE parent_id = ?',(ofid,)).fetchall():
 			if (name,) in forbidden_names:
 				cursor.execute('DELETE FROM deleted WHERE id = ?',(fid,))
 				self.move_deleted(fid,
-					cursor.execute('SELECT id FROM dirs WHERE parent_id=? AND name=?',(nfid,name)).fetchone()[0],
+					cursor.execute(
+						'SELECT id FROM dirs WHERE parent_id=? AND name=? UNION SELECT id FROM deleted WHERE parent_id=? AND name=?'
+						,(nfid,name,nfid,name)).fetchone()[0],
 					cursor)
 			else:
-				self.notify(0, 'MOVE_DELETED',ofid,nfid,name,fid)
 				cursor.execute('UPDATE deleted SET parent_id=? WHERE id = ?',(nfid,fid))
-				# зафиксирован непонятный баг
-				#2025-06-11 21:34:26.826996 M 909790 - /home/feelus/snap/obsidian/47/.config/obsidian/WebStorage/QuotaManager-journal
-				#2025-06-11 21:34:26.916598 M 909791 - /home/feelus/snap/obsidian/47/.config/obsidian/WebStorage/QuotaManager
-				#2025-06-11 21:34:26.918421 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
-				#2025-06-11 21:34:26.920199 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
-				#2025-06-11 21:34:44.570163 M 133195 - /var/lib/PackageKit/transactions.db
-				#2025-06-11 21:34:44.648264 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
-				#2025-06-11 21:34:44.650337 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
-				#2025-06-11 21:38:27.389297 M 909802 - /home/feelus/snap/obsidian/47/.config/obsidian/obsidian.log
-				#2025-06-11 21:38:27.509666 D 909560 - /home/feelus/snap/obsidian/47/.config/obsidian/Cache/Cache_Data/c2953739a8503c0c_0
-				#2025-06-11 21:38:27.510321 C 909560 - /home/feelus/snap/obsidian/47/.config/obsidian/Cache/Cache_Data/c2953739a8503c0c_0
-				#2025-06-11 21:38:27.513013 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
-				#2025-06-11 21:38:27.515749 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
-				#2025-06-11 21:38:27.532425 M 909576 - /home/feelus/snap/obsidian/47/.config/obsidian/Cache/Cache_Data/fc52697cff125bba_0
-				#2025-06-11 21:38:47.658768 M 909620 - /home/feelus/snap/obsidian/47/.config/obsidian/Cache/Cache_Data/index-dir/the-real-index
-				#2025-06-11 21:38:47.738998 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
-				#2025-06-11 21:38:47.741861 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
-				#2025-06-11 21:38:54.810869 M 909790 - /home/feelus/snap/obsidian/47/.config/obsidian/WebStorage/QuotaManager-journal
-				#2025-06-11 21:39:25.765197 M 909790 - /home/feelus/snap/obsidian/47/.config/obsidian/WebStorage/QuotaManager-journal
-				#2025-06-11 21:39:25.841623 M 909791 - /home/feelus/snap/obsidian/47/.config/obsidian/WebStorage/QuotaManager
-				#2025-06-11 21:39:25.844134 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
-				#2025-06-11 21:39:25.846094 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
-				#2025-06-11 21:40:01.222654 M 1184387 - /var/log/sysstat/sa11
-				#2025-06-11 21:40:01.301292 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
-				#2025-06-11 21:40:01.302792 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
-				#2025-06-11 21:43:28.558867 M 900439 - /home/feelus/.local/share/klipper/history2.lst
-				#2025-06-11 21:43:28.642556 M 910304 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.idx
-				#2025-06-11 21:43:28.644681 M 910303 - /home/feelus/.cache/mesa_shader_cache_db/part0/mesa_cache.db
-				#2025-06-11 21:43:31.881699 C 1221887 - /home/feelus/.local/share/recently-used.xbel.EKGS72
-				#2025-06-11 21:43:31.956905 V 1221887 - /home/feelus/.local/share/recently-used.xbel.EKGS72
-				#2025-06-11 21:43:31.957087 D 1220451 - /home/feelus/.local/share/recently-used.xbel
-				#2025-06-11 21:43:32.598175 M 900444 - /home/feelus/.local/share/kactivitymanagerd/resources/database-wal
-				#Traceback (most recent call last):
-				#  File "/home/feelus/pyfiles/src/filesdb.py", line 1543, in watch
-				#    if isinstance(event,FileSystemEvent):
-				#     ^^^^^^^^^^^^^^^^^^^^^^^
-				#  File "/home/feelus/pyfiles/src/filesdb.py", line 1487, in my_event_handler
-				#    else:
-				#  File "/home/feelus/pyfiles/src/filesdb.py", line 1199, in moved
-				#    return self.created(dest_path, stat, is_directory, is_synthetic, cursor)
-				#    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-				#  File "/home/feelus/pyfiles/src/filesdb.py", line 1143, in move
-				#    cursor.execute('DELETE FROM deleted WHERE parent_id=? AND name=?',(parent_id, name))
-				#    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-				#  File "/home/feelus/pyfiles/src/filesdb.py", line 1123, in move_deleted
-				#    else:
-				#sqlite3.IntegrityError: UNIQUE constraint failed: deleted.parent_id, deleted.name
-				#
-				#The above exception was the direct cause of the following exception:
-				#
-				#Traceback (most recent call last):
-				#  File "/home/feelus/pyfiles/src/filesdb.py", line 2153, in <module>
-				#
 
 	def move(self : Self, fid : int, dest_path : str, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		'''
@@ -1300,29 +1250,31 @@ class filesdb:
 		with self.CON:
 			self.CUR.execute('UPDATE dirs SET modified =0 WHERE modified==1')
 
-	def create_owner(self : Self, name : str, save : bool) -> None:
+	def create_owner(self : Self, name : str, save : bool) -> int:
 		'''
 		создает владельца, возвращает его id
 		'''
 		if self.server_in is not None: 
 			self.send2server(inspect.stack()[0][3], name, save)
+			sleep(1)
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 		with self.CON:
 			self.CUR.execute('INSERT INTO owners (name, save) VALUES (?, ?)', (name,save))
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 
-	def update_owner(self : Self, name : str, save : bool) -> None:
+	def update_owner(self : Self, name : str, save : bool) -> int:
 		'''
 		у существующего владельца обновляет параметр save, возвращает его id
 		'''
 		if self.server_in is not None: 
 			self.send2server(inspect.stack()[0][3], name, save)
+			sleep(1)
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 		with self.CON:
 			self.CUR.execute('UPDATE owners SET save = ? WHERE name = ?', (save,name))
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 
-	def credate_owner(self : Self, name : str, save : bool) -> None:
+	def credate_owner(self : Self, name : str, save : bool) -> int:
 		'''
 		создаёт владельца, а если он уже существует, то только обновляет его параметр save. Возвращает его id
 		'''
@@ -1330,10 +1282,10 @@ class filesdb:
 			self.send2server(inspect.stack()[0][3], name, save)
 			sleep(1)
 			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
-
-		self.CUR.execute('''INSERT INTO owners (name, save) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET
-			name = excluded.name,    save = excluded.save ''', (name,save))
-		return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
+		with self.CON:
+			self.CUR.execute('''INSERT INTO owners (name, save) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET
+				name = excluded.name,    save = excluded.save ''', (name,save))
+			return self.CUR.execute('SELECT id FROM owners WHERE name = ?',(name,)).fetchone()[0]
 
 	def del_owner(self : Self, owner : str) -> None:
 		'''
@@ -1428,9 +1380,10 @@ class filesdb:
 				fid,d = self.any2id_d(path)
 				if not d:
 					(oldoid,) = cursor.execute('SELECT owner FROM stat WHERE id = ?',(fid,)).fetchone()
+					cursor.execute('UPDATE stat SET owner = ? WHERE id = ?',(oid,fid))
 				else:
 					(oldoid,) = cursor.execute('SELECT owner FROM deleted WHERE id = ?',(fid,)).fetchone()
-				cursor.execute('UPDATE stat SET owner = ? WHERE id = ?',(oid,fid))
+					cursor.execute('UPDATE deleted SET owner = ? WHERE id = ?',(oid,fid))
 
 				def my_walk(did : int) -> None:
 					#self.notify(0,'my_walk',did)
@@ -1877,7 +1830,7 @@ class filesdb:
 			s+= typ2str(info.typ)
 		else:
 			s+='?'
-		s+=str(info.fid)
+		s+=f'{info.fid:7}'
 		out_data.append(s)
 
 		# access
@@ -2080,7 +2033,7 @@ class filesdb:
 
 	def unused_owners(self : Self) -> None:
 		for (oid, oname) in self.CUR.execute('''SELECT owners.id, owners.name  FROM owners WHERE owners.id NOT IN 
-				(SELECT stat.owner AS id FROM stat WHERE stat.owner NOT NULL /*UNION SELECT deleted.owner AS id FROM deleted WHERE deleted.owner NOT NULL*/)'''):
+				(SELECT stat.owner AS id FROM stat WHERE stat.owner NOT NULL UNION SELECT deleted.owner AS id FROM deleted WHERE deleted.owner NOT NULL)'''):
 			print(oid, oname, sep='\t')
 
 	def all_info(self : Self, interval : None|Tuple[None|float, None|float] =None, show_deleted : bool=True):
