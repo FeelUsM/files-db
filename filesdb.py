@@ -19,6 +19,7 @@ from typing import Optional, List, Any, Final, Self, Tuple, TextIO, Callable, ca
 #
 #source ../bin/activate
 #sudo ../bin/jupyter notebook --allow-root
+#jupyter notebook
 #
 #source ../bin/activate
 #cat fifo fifo fifo fifo | sudo ../bin/python -u filesdb.py root.db | tee -a root.log 
@@ -2136,13 +2137,13 @@ class filesdb:
 				raise Exception(f'database {files_db} does not exist. Create it with root_dirs argument')
 			self.FILES_DB = files_db
 			if ro:
-				print(f'connect in readonly mode to {self.FILES_DB}')
 				self.CON = sqlite3.connect('file:'+self.FILES_DB+'?mode=ro', uri=True)
+				print(f'connected in readonly mode to {self.FILES_DB}')
 			else:
-				print(f'connect in readwrite mode to {self.FILES_DB}')
 				self.CON = sqlite3.connect(self.FILES_DB)
 				db_mode = self.CON.execute("PRAGMA journal_mode=WAL;").fetchone()
 				assert db_mode==('wal',), db_mode
+				print(f'connected in readwrite mode to {self.FILES_DB}')
 			self.CUR = self.CON.cursor()
 
 			if not nocheck and not ro:
