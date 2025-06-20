@@ -18,44 +18,49 @@ def start(path):
     observer = Observer()
     observer.schedule(event_handler, path, recursive=True)
     observer.start()
+    return observer
+observers = []
 
-start('/boot')
-start('/root')
-start('/home')
+import platform
+if platform.system() == 'Windows':
+    observers.append(start('C:\\'))
+else:
+    observers.append(start('/boot'))
+    observers.append(start('/root'))
+    observers.append(start('/home'))
 
-start('/snap')
+    observers.append(start('/snap'))
 
-start('/bin.usr-is-merged')
-start('/sbin.usr-is-merged')
-start('/lib.usr-is-merged')
-start('/usr')
-start('/etc')
+    observers.append(start('/bin.usr-is-merged'))
+    observers.append(start('/sbin.usr-is-merged'))
+    observers.append(start('/lib.usr-is-merged'))
+    observers.append(start('/usr'))
+    observers.append(start('/etc'))
 
-start('/opt')
-start('/srv')
+    observers.append(start('/opt'))
+    observers.append(start('/srv'))
 
-start('/var')
-start('/tmp')
+    observers.append(start('/var'))
+    observers.append(start('/tmp'))
 
-#start('/lost+found')
+    #start('/lost+found')
 
+    #start('/media')
+    #start('/cdrom')
+    #start('/mnt')
+    #
+    #start('/proc')
+    #start('/sys')
+    #start('/dev')
+    #start('/run')
 
-#start('/media')
-#start('/cdrom')
-#start('/mnt')
-#
-#start('/proc')
-#start('/sys')
-#start('/dev')
-#start('/run')
-
-
-['media','cdrom','mnt','proc','sys','dev','run']
+    ['media','cdrom','mnt','proc','sys','dev','run']
 
 print('start watch')
 try:
     while True:
         print(input())
 finally:
-    observer.stop()
-    observer.join()
+    for observer in observers:
+        observer.stop()
+        observer.join()
