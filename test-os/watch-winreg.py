@@ -20,13 +20,13 @@ if 0:
     import pythoncom
     from win32com.client import GetObject
 
-    def registry_event_handler():
+    def registry_event_handler(x):
         pythoncom.CoInitialize()
         wmi = GetObject("winmgmts:\\\\.\\root\\default")
         query = wmi.ExecNotificationQuery(
             "SELECT * FROM RegistryKeyChangeEvent "
             "WHERE Hive='HKEY_LOCAL_MACHINE' "
-            "AND KeyPath='SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run'"
+            #"AND KeyPath='SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run'"
         )
         while True:
             event = query.NextEvent()
@@ -74,8 +74,8 @@ if 0:
             print('\tTIME_CREATED=');    pprint(event.TIME_CREATED)
             print('==================================================')
 
-else:
-    def registry_event_handler(hive):
+elif 0:
+    def registry_event_handler(name,hive):
         import ctypes
         import winreg
         from datetime import datetime
@@ -108,9 +108,10 @@ else:
                 True   # Асинхронный режим
             )
 
+            print(type(event), event)
             # Ждем сигнала об изменении
             ctypes.windll.kernel32.WaitForSingleObject(event, 0xFFFFFFFF)
-            print("Обнаружено изменение в реестре!",datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            print("Обнаружено изменение в реестре!",datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name)
 
             # Сброс события
             ctypes.windll.kernel32.ResetEvent(event)
@@ -118,16 +119,114 @@ else:
         # https://stackoverflow.com/questions/79673752/how-to-determine-which-key-in-windows-registry-has-been-changed/79673838#79673838
         # https://chatgpt.com/share/6855e162-9944-800a-b448-2dbf5ca6f51b
 
+else:
+    def registry_event_handler(name,hive):
+        #import pythoncom
+        from win32com.client import GetObject
+        from pprint import pprint
+
+        print(f"Ожидание изменений в {name}... (нажмите Ctrl+C для выхода)")
+
+        # Получаем доступ к WMI (namespace root\default для Registry событий)
+        wmi = GetObject("winmgmts:\\\\.\\root\\default")
+
+        # Подписываемся на RegistryTreeChangeEvent в HKLM (вся ветка)
+        query = f"""
+        SELECT * FROM RegistryTreeChangeEvent
+        WHERE Hive = '{name}' AND RootPath = ''
+        """
+
+        # Выполняем подписку
+        watcher = wmi.ExecNotificationQuery(query)
+
+        # Основной цикл ожидания событий
+        while True:
+            event = watcher.NextEvent()  # Блокирующий вызов, ждет события
+            print("Изменение в HKEY_LOCAL_MACHINE или поддереве!")#, dir(event))
+            #print('\tAddRef =', str(event.AddRef))   # AddRef = <bound method AddRef of <COMObject NextEvent>>
+            #print('\tAssociatorsAsync_ =', str(event.AssociatorsAsync_))   # AssociatorsAsync_ = <bound method AssociatorsAsync_ of <COMObject NextEvent>>
+            #print('\tAssociators_ =', str(event.Associators_))   # Associators_ = <bound method Associators_ of <COMObject NextEvent>>
+            #print('\tClone_ =', str(event.Clone_))   # Clone_ = <bound method Clone_ of <COMObject NextEvent>>
+            #print('\tCompareTo_ =', str(event.CompareTo_))   # CompareTo_ = <bound method CompareTo_ of <COMObject NextEvent>>
+            #print('\tDeleteAsync_ =', str(event.DeleteAsync_))   # DeleteAsync_ = <bound method DeleteAsync_ of <COMObject NextEvent>>
+            #print('\tDelete_ =', str(event.Delete_))   # Delete_ = <bound method Delete_ of <COMObject NextEvent>>
+            print('\tDerivation_ =', str(event.Derivation_))   # Derivation_ = ('RegistryEvent', '__ExtrinsicEvent', '__Event', '__IndicationRelated', '__SystemClass')
+            #print('\tExecMethodAsync_ =', str(event.ExecMethodAsync_))   # ExecMethodAsync_ = <bound method ExecMethodAsync_ of <COMObject NextEvent>>
+            #print('\tExecMethod_ =', str(event.ExecMethod_))   # ExecMethod_ = <bound method ExecMethod_ of <COMObject NextEvent>>
+            #print('\tGetIDsOfNames =', str(event.GetIDsOfNames))   # GetIDsOfNames = <bound method GetIDsOfNames of <COMObject NextEvent>>
+            #print('\tGetObjectText_ =', str(event.GetObjectText_))   # GetObjectText_ = <bound method GetObjectText_ of <COMObject NextEvent>>
+            #print('\tGetText_ =', str(event.GetText_))   # GetText_ = <bound method GetText_ of <COMObject NextEvent>>
+            #print('\tGetTypeInfo =', str(event.GetTypeInfo))   # GetTypeInfo = <bound method GetTypeInfo of <COMObject NextEvent>>
+            #print('\tGetTypeInfoCount =', str(event.GetTypeInfoCount))   # GetTypeInfoCount = <bound method GetTypeInfoCount of <COMObject NextEvent>>
+            print('\tHive =', str(event.Hive))   # Hive = HKEY_LOCAL_MACHINE
+            #print('\tInstancesAsync_ =', str(event.InstancesAsync_))   # InstancesAsync_ = <bound method InstancesAsync_ of <COMObject NextEvent>>
+            #print('\tInstances_ =', str(event.Instances_))   # Instances_ = <bound method Instances_ of <COMObject NextEvent>>
+            #print('\tInvoke =', str(event.Invoke))   # Invoke = <bound method Invoke of <COMObject NextEvent>>
+            print('\tMethods_ =', str(event.Methods_))   # Methods_ = <COMObject <unknown>>
+            print('\tPath_ =', str(event.Path_), dir(event.Path_))   # Path_ =
+
+            print('Authority = ',event.Path_.Authority)
+            print('Class = ',event.Path_.Class)
+            print('DisplayName = ',event.Path_.DisplayName)
+            print('IsClass = ',event.Path_.IsClass)
+            print('IsSingleton = ',event.Path_.IsSingleton)
+            print('Keys = ',event.Path_.Keys)
+            print('Locale = ',event.Path_.Locale)
+            print('Namespace = ',event.Path_.Namespace)
+            print('ParentNamespace = ',event.Path_.ParentNamespace)
+            print('Path = ',event.Path_.Path)
+            print('RelPath = ',event.Path_.RelPath)
+            print('Security_ = ',event.Path_.Security_)
+            print('Server = ',event.Path_.Server)
+            print('SetAsClass = ',event.Path_.SetAsClass)
+            print('SetAsSingleton = ',event.Path_.SetAsSingleton)
+
+
+
+            
+            print('\tProperties_ =', str(event.Properties_))   # Properties_ = <COMObject <unknown>>
+            #print('\tPutAsync_ =', str(event.PutAsync_))   # PutAsync_ = <bound method PutAsync_ of <COMObject NextEvent>>
+            #print('\tPut_ =', str(event.Put_))   # Put_ = <bound method Put_ of <COMObject NextEvent>>
+            print('\tQualifiers_ =', str(event.Qualifiers_))   # Qualifiers_ = <COMObject <unknown>>
+            #print('\tQueryInterface =', str(event.QueryInterface))   # QueryInterface = <bound method QueryInterface of <COMObject NextEvent>>
+            #print('\tReferencesAsync_ =', str(event.ReferencesAsync_))   # ReferencesAsync_ = <bound method ReferencesAsync_ of <COMObject NextEvent>>
+            #print('\tReferences_ =', str(event.References_))   # References_ = <bound method References_ of <COMObject NextEvent>>
+            #print('\tRefresh_ =', str(event.Refresh_))   # Refresh_ = <bound method Refresh_ of <COMObject NextEvent>>
+            #print('\tRelease =', str(event.Release))   # Release = <bound method Release of <COMObject NextEvent>>
+            print('\tRootPath =', str(event.RootPath))   # RootPath =
+            print('\tSECURITY_DESCRIPTOR =', str(event.SECURITY_DESCRIPTOR))   # SECURITY_DESCRIPTOR = None
+            print('\tSecurity_ =', str(event.Security_))   # Security_ = <COMObject <unknown>>
+            #print('\tSetFromText_ =', str(event.SetFromText_))   # SetFromText_ = <bound method SetFromText_ of <COMObject NextEvent>>
+            #print('\tSpawnDerivedClass_ =', str(event.SpawnDerivedClass_))   # SpawnDerivedClass_ = <bound method SpawnDerivedClass_ of <COMObject NextEvent>>
+            #print('\tSpawnInstance_ =', str(event.SpawnInstance_))   # SpawnInstance_ = <bound method SpawnInstance_ of <COMObject NextEvent>>
+            #print('\tSubclassesAsync_ =', str(event.SubclassesAsync_))   # SubclassesAsync_ = <bound method SubclassesAsync_ of <COMObject NextEvent>>
+            #print('\tSubclasses_ =', str(event.Subclasses_))   # Subclasses_ = <bound method Subclasses_ of <COMObject NextEvent>>
+            print('\tSystemProperties_ =', str(event.SystemProperties_))   # SystemProperties_ = <COMObject <unknown>>
+            print('\tTIME_CREATED =', str(event.TIME_CREATED))   # TIME_CREATED = 133951042200066923
+
+
 import winreg
 threads = []
-for hive in [winreg.HKEY_CLASSES_ROOT,winreg.HKEY_CURRENT_USER,winreg.HKEY_LOCAL_MACHINE,winreg.HKEY_USERS,winreg.HKEY_CURRENT_CONFIG]:
-    thr = threading.Thread(target = registry_event_handler, args=(hive,), name='registry_event_handler', daemon=True)
+for name,hive in [
+    #('HKEY_CLASSES_ROOT',winreg.HKEY_CLASSES_ROOT),
+    #('HKEY_CURRENT_USER',winreg.HKEY_CURRENT_USER),
+    ('HKEY_LOCAL_MACHINE',winreg.HKEY_LOCAL_MACHINE),
+    #('HKEY_USERS',winreg.HKEY_USERS),
+    #('HKEY_CURRENT_CONFIG',winreg.HKEY_CURRENT_CONFIG)
+    ]:
+    #input('create thread')
+    thr = threading.Thread(target = registry_event_handler, args=(name,hive), name='registry_event_handler', daemon=True)
+    #input('start thread')
     thr.start()
     threads.append(thr)
 
-#f = open('reg.log','a')
+#f = open('reg.log','w')
 #print('start',file=f)
 print('start, to stop type q')
+#input(1)
+#input(2)
+#input(3)
+#input(4)
 x= ''
 while x!='q':
     try:
@@ -135,7 +234,7 @@ while x!='q':
     except EOFError:
         x = 'q'
     #print('>>',repr(x),file=f)
-    #print('>>',repr(x))
+    print('>>',repr(x))
 #print('stop',file=f)
 print('stop')
 for thr in threads:
