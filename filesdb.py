@@ -65,7 +65,11 @@ def internal_path(path : str) -> str:
 	#	path = os.getcwd()
 	#path = os.path.abspath(path)
 	assert os.path.isabs(path)
-	path = path.replace(os.sep+os.sep,os.sep).replace(os.sep+os.sep,os.sep).replace(os.sep+os.sep,os.sep).replace(os.sep+os.sep,os.sep)
+	path1 = path.replace(os.sep+os.sep,os.sep)
+	while path1!=path:
+		path = path1
+		path1 = path.replace(os.sep+os.sep,os.sep)
+	path = path1
 	if path[-1]==os.sep:
 		path = path[:-1]
 	if os.name=='nt':
@@ -118,13 +122,10 @@ def is_other(mode : int) -> bool: return STAT.S_ISCHR(mode) or STAT.S_ISBLK(mode
 					STAT.S_ISDOOR(mode) or STAT.S_ISPORT(mode) or\
 					STAT.S_ISWHT(mode)
 def simple_type(mode : int) -> int:
-	typ = MLINK if STAT.S_ISLNK(mode) else\
-		MDIR if STAT.S_ISDIR(mode) else\
-		MFILE if STAT.S_ISREG(mode) else\
-		MOTHER if STAT.S_ISCHR(mode) or STAT.S_ISBLK(mode) or\
-			STAT.S_ISFIFO(mode) or STAT.S_ISSOCK(mode) or\
-			STAT.S_ISDOOR(mode) or STAT.S_ISPORT(mode) or\
-			STAT.S_ISWHT(mode) else \
+	typ = MLINK if is_link(mode) else\
+		MDIR if is_dir(mode) else\
+		MFILE if is_file(mode) else\
+		MOTHER if is_other(mode) else \
 		None
 	if typ is None:
 		raise Exception('unknown type')
@@ -951,7 +952,8 @@ class filesdb:
 					path = None
 					try:
 						path = external_path(self.id2path(fid,cursor))
-						hsh = hashlib.md5(open(path,'rb').read()).hexdigest()
+						with open(path,'rb') as f:
+							hsh = hashlib.md5(f.read()).hexdigest()
 					except FileNotFoundError:
 						self.set_modified(fid, cursor)
 					except Exception as e:

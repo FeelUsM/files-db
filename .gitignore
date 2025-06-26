@@ -3,6 +3,8 @@
 *.db-wal
 *.db-journal
 *.log
+*.txt
+*.json
 .ipynb_checkpoints
 __pycache__
 .virtual_documents
