@@ -18,12 +18,17 @@ def start(path):
     observer = Observer()
     observer.schedule(event_handler, path, recursive=True)
     observer.start()
+    print('start ibserving',path)
     return observer
+
+print(Observer.__name__)
 observers = []
 
 import platform
 if platform.system() == 'Windows':
     observers.append(start('C:\\'))
+elif platform.system().startswith('CYGWIN'):
+    observers.append(start('/cygdrive/c'))
 else:
     observers.append(start('/boot'))
     observers.append(start('/root'))
