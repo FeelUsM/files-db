@@ -12,6 +12,8 @@ import yaml
 import socket
 from pprint import pprint
 
+from my_stat import get_username_by_uid, get_groupname_by_gid, stat_eq, os_readlink, os_stat, STAT_DENIED, external_path, make_stat
+
 from typing import Optional, List, Any, Final, Self, Tuple, TextIO, Callable, cast, Set
 
 #=== on startup ===
@@ -41,8 +43,9 @@ class AttrDict(dict):
 		return self[key]
 	def __setattr__(self, key, value):
 		self[key] = value
-def make_dict(**kwargs):
+def make_dict(**kwargs) -> AttrDict:
 	return AttrDict(kwargs)
+
 
 class NullContextManager(object):
     def __init__(self, dummy_resource=None):
@@ -75,57 +78,49 @@ def internal_path(path : str) -> str:
 	if os.name=='nt':
 		path = os.sep+path
 	return path
-def external_path(path : str) -> str:
-	'''
-	повторное применеие этой функции допустимо
-	'''
-	if os.name=='nt':
-		if path.count(os.sep)==1 and path[0]==os.sep:
-			path+=os.sep
-		if path[0]==os.sep:
-			path = path[1:]
-	return path
+
 def normalize_path(path : Optional[str]) -> str:
 	if path is None: path = os.getcwd()
 	return internal_path(os.path.abspath(path))
 
-# dirs:modified
-# 2 - pre-root-dir
-# 1 - modified
-# 0 - not modified
-
-# hist:static_found
-# 0 - обнаружено watchdog-ом, 
-# 1 - обнаружено статитсеским обходом дерева каталогов 
-# 2 - обнаружено путём сравнения хешей
+def access2str(st_mode : int) -> str:
+	mode = STAT.S_IMODE(st_mode)
+	assert mode < 2**11, mode
+	s = ''
+	for i in range(6,-1,-3):
+		s+= 'r' if mode & 2**(i+2) else '-'
+		s+= 'w' if mode & 2**(i+1) else '-'
+		s+= 'x' if mode & 2**(i+0) else '-'
+	if mode & 2**9:
+		s = s[:-1]+ ('t' if mode & 1 else 'T')
+	if mode & 2**10:
+		s = s[:5]+ ('s' if mode & 16 else 'S') + s[6:]
+	return s
 
 # dirs:type
-MFILE : Final = 0
-MDIR : Final = 1
-MLINK : Final = 2
-MOTHER : Final = 3 # встречаются всякие сокеты, именованные каналы. Не смотря на то, что в /sys, /dev, /proc, /run - не лезем
-
-def os_stat(path : str, follow_symlinks : bool =False) -> os.stat_result:
-	return os.stat(external_path(path),follow_symlinks=follow_symlinks)
+TFILE : Final = 0
+TDIR : Final = 1
+TLINK : Final = 2
+TOTHER : Final = 3 # встречаются всякие сокеты, именованные каналы. Не смотря на то, что в /sys, /dev, /proc, /run - не лезем
 
 def typ2str(x : int) -> str:
 	assert 0<=x<=3
-	return '-' if x==MFILE else \
-			'd'if x==MDIR else \
-			'l'if x==MLINK else \
-			'o'#if x==MOTHER
+	return '-' if x==TFILE else \
+			'd'if x==TDIR else \
+			'l'if x==TLINK else \
+			'o'#if x==TOTHER
 def is_link (mode : int) -> bool: return STAT.S_ISLNK(mode)
 def is_dir  (mode : int) -> bool: return STAT.S_ISDIR(mode)
 def is_file (mode : int) -> bool: return STAT.S_ISREG(mode)
 def is_other(mode : int) -> bool: return STAT.S_ISCHR(mode) or STAT.S_ISBLK(mode) or\
 					STAT.S_ISFIFO(mode) or STAT.S_ISSOCK(mode) or\
 					STAT.S_ISDOOR(mode) or STAT.S_ISPORT(mode) or\
-					STAT.S_ISWHT(mode)
+					STAT.S_ISWHT(mode) or mode&STAT_DENIED
 def simple_type(mode : int) -> int:
-	typ = MLINK if is_link(mode) else\
-		MDIR if is_dir(mode) else\
-		MFILE if is_file(mode) else\
-		MOTHER if is_other(mode) else \
+	typ = TLINK if is_link(mode) else\
+		TDIR if is_dir(mode) else\
+		TFILE if is_file(mode) else\
+		TOTHER if is_other(mode) else \
 		None
 	if typ is None:
 		raise Exception('unknown type')
@@ -144,76 +139,18 @@ def etyp2str(etyp : int) -> str:
 			'V'if etyp==EMOVE else\
 			'D'#if etyp==EDEL
 
-def stat_eq(stat : os.stat_result, ostat : os.stat_result) -> bool:
-	'''
-	сравнивает два stat-а на равенство
-	если это директории: должно совпадать всё кроме access_time и modification_time
-	иначе: должно совпадать всё кроме access_time
-	'''
-	if stat.st_mode != ostat.st_mode:
-		#if VERBOSE>=2: print('st_mode')
-		return False
-	if stat.st_ino != ostat.st_ino:
-		#if VERBOSE>=2: print('st_ino')
-		return False
-	if stat.st_dev != ostat.st_dev:
-		#if VERBOSE>=2: print('st_dev')
-		return False
-	if stat.st_nlink != ostat.st_nlink:
-		#if VERBOSE>=2: print('st_nlink')
-		return False
-	if stat.st_uid != ostat.st_uid:
-		#if VERBOSE>=2: print('st_uid')
-		return False
-	if stat.st_gid != ostat.st_gid:
-		#if VERBOSE>=2: print('st_gid')
-		return False
-	if stat.st_size != ostat.st_size:
-		#if VERBOSE>=2: print('st_size')
-		return False
-	if stat.st_ctime != ostat.st_ctime:
-		#if VERBOSE>=2: print('st_ctime',datetime.fromtimestamp(ostat.st_ctime),datetime.fromtimestamp(stat.st_ctime))
-		return False
-	if simple_type(stat.st_mode)!=MDIR and stat.st_mtime != ostat.st_mtime:
-		#if VERBOSE>=2: print('st_mtime')
-		return False
-	if os.name!='nt' and stat.st_blocks != ostat.st_blocks: # type: ignore[attr-defined]
-		#if VERBOSE>=2: print('st_blocks')
-		return False
-	if os.name!='nt' and stat.st_blksize != ostat.st_blksize: # type: ignore[attr-defined]
-		#if VERBOSE>=2: print('st_blksize')
-		return False
-	return True
+# dirs:modified
+NOT_MODIFIED = 0
+MODIFIED = 1
+PRE_ROOT_DIR_MODIF = 2 # такие папки не обходим и соостестсвенно, изменилась они или нет - не имеет смысла
 
-def get_username_by_uid(uid : int) -> str:
-	if os.name == 'nt':
-		return 'dummy'
-	else:
-		import pwd
-		return pwd.getpwuid(uid).pw_name # type: ignore[attr-defined]
-def get_groupname_by_gid(gid : int) -> str:
-	if os.name == 'nt':
-		return 'dummy'
-	else:
-		import grp
-		return grp.getgrgid(gid).gr_name # type: ignore[attr-defined]
-def access2str(st_mode : int) -> str:
-	mode = STAT.S_IMODE(st_mode)
-	assert mode < 2**11, mode
-	s = ''
-	for i in range(6,-1,-3):
-		s+= 'r' if mode & 2**(i+2) else '-'
-		s+= 'w' if mode & 2**(i+1) else '-'
-		s+= 'x' if mode & 2**(i+0) else '-'
-	if mode & 2**9:
-		s = s[:-1]+ ('t' if mode & 1 else 'T')
-	if mode & 2**10:
-		s = s[:5]+ ('s' if mode & 16 else 'S') + s[6:]
-	return s
+# hist:static_found
+FOUND_BY_WATCHDOG = 0
+FOUND_BY_WALK = 1
+FOUND_BY_CACHECOMPARE = 2
 
 
 class filesdb:
-
 	VERBOSE : float = 0.5
 	# 0.5 - сообщать об изменениях объектов, которые не имеют владельцев
 	# 1   - сообщать о записываемых событиях
@@ -308,7 +245,7 @@ class filesdb:
 				parent_id INTEGER NOT NULL,                  /* id папки, в которой лежит данный объект */
 				name      TEXT    NOT NULL,                  /* имя объекта в папке */
 				id        INTEGER PRIMARY KEY AUTOINCREMENT, /* идентификатор объекта во всей БД */
-				type      INTEGER NOT NULL,                  /* MFILE, MDIR, MLINK, MOTHER */
+				type      INTEGER NOT NULL,                  /* TFILE, TDIR, TLINK, TOTHER */
 				modified  INTEGER NOT NULL,                  /* параметр обхода:
 					0 - заходим при полном обходе
 					1 - заходим приобходе модифицированных объектов
@@ -336,7 +273,11 @@ class filesdb:
 				st_blocks  INTEGER,
 				st_blksize INTEGER,
 				
-				data       TEXT, /* для файлов - хэш, для папок - хэш = сумма хэшей вложенных объектов (mod 2^32), для симлинков - сама ссылка */
+				data       TEXT, /* 
+					для файлов - хэш, 
+					для папок - хэш = сумма хэшей вложенных объектов (mod 2^32), 
+					для симлинков - сама ссылка
+					если не читается - NULL*/
 				owner      INTEGER
 			)
 			''')
@@ -493,7 +434,7 @@ class filesdb:
 			st_mode&0xf000==? AND type!=? OR
 			st_mode&0xf000==? AND type!=? OR
 			st_mode&0xf000!=? AND st_mode&0xf000!=? AND st_mode&0xf000!=? AND type!=?
-			''',(STAT.S_IFREG,MFILE, STAT.S_IFLNK,MLINK, STAT.S_IFDIR,MDIR, STAT.S_IFREG,STAT.S_IFLNK,STAT.S_IFDIR, MOTHER)).fetchall()
+			''',(STAT.S_IFREG,TFILE, STAT.S_IFLNK,TLINK, STAT.S_IFDIR,TDIR, STAT.S_IFREG,STAT.S_IFLNK,STAT.S_IFDIR, TOTHER)).fetchall()
 		assert len(n)==0, f'mismatch types: {n}'
 		#assert t2==simple_type(mode), (t2,simple_type(mode))
 
@@ -628,20 +569,20 @@ class filesdb:
 
 		#print(ids,fid,pathl)
 		for name in pathl[len(ids):-1]:
-			cursor.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 2, ?)',(fid, name, MDIR))
+			cursor.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, PRE_ROOT_DIR_MODIF, ?)',(fid, name, TDIR))
 			(fid,) = cursor.execute('SELECT id FROM dirs WHERE parent_id =? AND name=?',(fid,name)).fetchone()
 			assert fid is not None
 		try:
 			stat = os_stat(path)
 		except Exception as e:
 			self.notify(0,pathl,type(e),e)
-			self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (fid, pathl[-1], MDIR))
+			self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, NOT_MODIFIED, ?)', (fid, pathl[-1], TDIR))
 			(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(fid, pathl[-1])).fetchone()
 			assert fid is not None
-			self.CUR.execute('INSERT INTO stat (id,type) VALUES (?,?)', (fid,MDIR))
+			self.CUR.execute('INSERT INTO stat (id,type) VALUES (?,?)', (fid,TDIR))
 			print('blindly create dir')
 		else:
-			self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (fid, pathl[-1], simple_type(stat.st_mode)))
+			self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, NOT_MODIFIED, ?)', (fid, pathl[-1], simple_type(stat.st_mode)))
 			(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(fid, pathl[-1])).fetchone()
 			assert fid is not None
 			self.CUR.execute('INSERT INTO stat (id,type) VALUES (?,?)', (fid,simple_type(stat.st_mode)))
@@ -665,7 +606,7 @@ class filesdb:
 						print('...',root)
 						t = time()
 					#self.notify(0,root,pathids,dirs)
-					# при выполнении stat MFILE/MDIR может быть заменён на MLINK или MOTHER
+					# при выполнении stat TFILE/TDIR может быть заменён на TLINK или TOTHER
 					for name in dirs+files:
 						try:
 							name.encode("utf8", errors="surrogateescape")
@@ -678,9 +619,9 @@ class filesdb:
 						except Exception as e:
 							self.notify(0,root+os.sep+name,type(e),e)
 							if name in dirs:
-								self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (pathids[-1], name, MDIR))
+								self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (pathids[-1], name, TDIR))
 								(fid,) = self.CUR.execute('SELECT id FROM dirs WHERE parent_id = ? AND name = ?',(pathids[-1], name)).fetchone()
-								self.CUR.execute('INSERT INTO stat (id,type) VALUES (?,?)', (fid,MDIR))
+								self.CUR.execute('INSERT INTO stat (id,type) VALUES (?,?)', (fid,TDIR))
 								self.notify(0,'blindly create dir')
 						else:
 							self.CUR.execute('INSERT INTO dirs (parent_id, name, modified, type) VALUES (?, ?, 0, ?)', (pathids[-1], name, simple_type(stat.st_mode)))
@@ -844,7 +785,7 @@ class filesdb:
 			# cохранить старый stat
 			# условие для папки - если изменился её stat (st_atime, st_mtime не учитываем)
 			# условие для файла - если с предыдущего обновления прошло больше 10 сек
-			if simple_type(stat.st_mode)==MDIR:
+			if simple_type(stat.st_mode)==TDIR:
 				save1 = not stat_eq(stat,self.get_stat(fid,cursor))
 			else:
 				save1 = True
@@ -907,7 +848,7 @@ class filesdb:
 		def my_walk(did : int) -> None:
 			n = cursor.execute('SELECT name,id,type FROM dirs WHERE parent_id = ? ',(did,)).fetchall()
 			for name,fid,ftype in n:
-				if ftype==MDIR:
+				if ftype==TDIR:
 					my_walk(fid)
 				(owner,) = cursor.execute('SELECT owner FROM stat WHERE id = ?', (fid,)).fetchone()
 				if save:
@@ -942,32 +883,37 @@ class filesdb:
 			with closing(self.CON.cursor()) as cursor:
 				ids:List[Tuple[int]]
 				if with_all:
-					ids = cursor.execute('SELECT id FROM dirs WHERE type = ?',(MFILE,)).fetchall()
+					ids = cursor.execute('SELECT id FROM dirs WHERE type = ?',(TFILE,)).fetchall()
 				else:
-					ids = cursor.execute('SELECT id FROM dirs WHERE type = ? AND modified = 1',(MFILE,)).fetchall()
+					ids = cursor.execute('SELECT id FROM dirs WHERE type = ? AND modified = MODIFIED',(TFILE,)).fetchall()
 				cnt = 0
 				print('calc hashes:')
 				for fid1 in (tqdm(ids) if __name__!="__main__" else ids):
 					fid = fid1[0]
 					path = None
+					path = external_path(self.id2path(fid,cursor))
 					try:
-						path = external_path(self.id2path(fid,cursor))
-						with open(path,'rb') as f:
-							hsh = hashlib.md5(f.read()).hexdigest()
+						f = open(path,'rb')
 					except FileNotFoundError:
-						self.set_modified(fid, cursor)
+						self.delete(fid, True, cursor)
+						continue
+					except PermissionError:
+						hsh = None
 					except Exception as e:
 						self.raise_notify(e,fid,path)
+						continue
 					else:
-						(ohash,) = cursor.execute('SELECT data FROM stat WHERE id = ?',(fid,)).fetchone()
-						if ohash is not None and ohash!=hsh:
-							self.modify(fid, os_stat(path), 2, cursor)
-						cursor.execute('UPDATE stat SET data = ? WHERE id = ?',(hsh,fid))
-						cursor.execute('UPDATE dirs SET modified = 0 WHERE id = ?',(fid,))
-						cnt+=1
-						if cnt%1000000==0:
-							print('COMMIT update_hashes')
-							cursor.execute('COMMIT')
+						with f:
+							hsh = hashlib.md5(f.read()).hexdigest()
+					(ohash,) = cursor.execute('SELECT data FROM stat WHERE id = ?',(fid,)).fetchone()
+					if ohash is not None and ohash!=hsh:
+						self.modify(fid, os_stat(path), FOUND_BY_CACHECOMPARE, cursor)
+					cursor.execute('UPDATE stat SET data = ? WHERE id = ?',(hsh,fid))
+					cursor.execute('UPDATE dirs SET modified = 0 WHERE id = ?',(fid,))
+					cnt+=1
+					if cnt%1000000==0:
+						print('COMMIT update_hashes')
+						cursor.execute('COMMIT')
 
 		# обновить симлинки, директории, сынтегрировать хеши
 		with self.CON:
@@ -976,30 +922,33 @@ class filesdb:
 					n = cursor.execute('SELECT name,id,type,modified FROM dirs WHERE parent_id = ? ',(did,)).fetchall()
 					hsh : int|None = 0
 					for name,fid,ftype,modified in n:
-						if ftype==MFILE:
+						if ftype==TFILE:
 							try:
 								(lhsh,) = cursor.execute('SELECT data FROM stat WHERE id = ?',(fid,)).fetchone()
 							except Exception as e:
 								lhsh = None
 								self.raise_notify(e,fid)
-						elif ftype==MLINK:
+						elif ftype==TLINK:
 							try:
-								lnk = os.readlink(external_path(self.id2path(fid,cursor)))
+								lnk = os_readlink(external_path(self.id2path(fid,cursor)))
+							except FileNotFoundError:
+								self.delete(fid, True, cursor)
+								continue
+							except PermissionError:
+								hsh = None
+							else:
 								(olink,) = cursor.execute('SELECT data FROM stat WHERE id = ?',(fid,)).fetchone()
 								if olink is not None and olink!=lnk:
-									self.modify(fid, os_stat(self.id2path(fid)), 2, cursor)
+									self.modify(fid, os_stat(self.id2path(fid)), FOUND_BY_CACHECOMPARE, cursor)
 								lhsh = hashlib.md5(lnk.encode()).hexdigest()
 								cursor.execute('UPDATE stat SET data = ? WHERE id = ?',(lnk,fid))
 								cursor.execute('UPDATE dirs SET modified = 0 WHERE id = ?',(fid,))
-							except FileNotFoundError:
-								self.set_modified(fid, cursor)
-								lhsh = None
-						elif ftype==MDIR:
+						elif ftype==TDIR:
 							if with_all or modified!=0:
-								lhsh = str(my_walk(fid,modified==2))
+								lhsh = str(my_walk(fid,modified==PRE_ROOT_DIR_MODIF))
 							else:
 								(lhsh,) = cursor.execute('SELECT data FROM stat WHERE id = ?',(fid,)).fetchone()
-						elif ftype==MOTHER:
+						elif ftype==TOTHER:
 							lhsh = hex( 0 )[2:].zfill(32)
 							cursor.execute('UPDATE dirs SET modified = 0 WHERE id = ?',(fid,))
 						else:
@@ -1018,7 +967,7 @@ class filesdb:
 					return hsh
 				my_walk(0,True)
 
-	def walk_stat1(self : Self, with_all : bool, did : int, *, progress : Optional[Callable[[],None]]=None, path : str='', typ : int=MDIR, modified : int=0) -> bool:
+	def walk_stat1(self : Self, with_all : bool, did : int, *, progress : Optional[Callable[[],None]]=None, path : str='', typ : int=TDIR, modified : int=0) -> bool:
 		# path, typ, modified - внутренние рекурсивные параметры, не предназначенные для внешнего вызова
 		# only_modified === not with_all
 		# если это не pre-root-dir
@@ -1034,7 +983,7 @@ class filesdb:
 		#	просматриваем дочерние объeкты, какие есть(с учётом only_modified)
 		this_modified = False
 		if did!=0 and modified!=2:
-			if typ==MDIR:
+			if typ==TDIR:
 				children = self.CUR.execute('SELECT name,id,type,modified FROM dirs WHERE parent_id = ?',(did,)).fetchall()
 				real_children = os.listdir(external_path(path))
 				children2 = []
@@ -1124,7 +1073,7 @@ class filesdb:
 		for name in pathl[len(ids):-1]:
 			parent_path+= (os.sep+name)
 			lstat = os_stat(parent_path) # FileNotFoundError будет пойман в области watchdog-а
-			assert simple_type(lstat.st_mode)==MDIR, simple_type(lstat.st_mode)
+			assert simple_type(lstat.st_mode)==TDIR, simple_type(lstat.st_mode)
 			fid = self.create(fid, name, lstat, True, cursor, owner, save)
 
 		return fid, pathl[-1], owner, save
@@ -1661,7 +1610,7 @@ class filesdb:
 				parent_id: int,
 				name	:str,
 				fid		:int,
-				typ		:int, # MFILE/MDIR/MLINK/MOTHER
+				typ		:int, # TFILE/TDIR/TLINK/TOTHER
 				modified:int, # 0 нет, 1 да, 2 это pre-root-dir
 				deleted	:int|bool,
 				path	:str,
@@ -1700,7 +1649,7 @@ class filesdb:
 				parent_id=0,
 				name	='',
 				fid		=0,
-				typ		=MDIR,
+				typ		=TDIR,
 				modified=2,
 				deleted	=0,
 				path	='/',
@@ -1887,7 +1836,7 @@ class filesdb:
 		# data
 		if info_lev==2:
 			if info.data is not None and info.typ is not None:
-				out_data.append(('->' if info.typ==MLINK else '')+str(info.data))
+				out_data.append(('->' if info.typ==TLINK else '')+str(info.data))
 			else:
 				out_data.append('???')
 
