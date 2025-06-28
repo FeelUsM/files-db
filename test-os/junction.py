@@ -435,7 +435,7 @@ with open('types.txt', 'r') as f:
 				FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 				b1 = bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT)
 
-				stat = os.stat(path)
+				stat = os.stat(path,follow_symlinks=False)
 				#print(stat)
 				#print(hex(stat.st_mode))
 				b2 = STAT.S_ISLNK(stat.st_mode)
