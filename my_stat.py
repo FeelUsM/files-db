@@ -1,6 +1,7 @@
 import stat as STAT
 import os
 import ctypes
+import sys
 
 STAT_MAX = STAT.S_IFSOCK|STAT.S_IFLNK|STAT.S_IFREG|STAT.S_IFBLK|STAT.S_IFDIR|STAT.S_IFCHR|STAT.S_IFIFO|STAT.S_IFDOOR|STAT.S_IFPORT|STAT.S_IFWHT|\
 	STAT.S_ISUID|STAT.S_ISGID|STAT.S_ISVTX|STAT.S_IRWXU|STAT.S_IRUSR|STAT.S_IWUSR|STAT.S_IXUSR|STAT.S_IRWXG|STAT.S_IRGRP|STAT.S_IWGRP|STAT.S_IXGRP|\
@@ -8,7 +9,7 @@ STAT_MAX = STAT.S_IFSOCK|STAT.S_IFLNK|STAT.S_IFREG|STAT.S_IFBLK|STAT.S_IFDIR|STA
 STAT_DENIED = 1
 while STAT_DENIED<=STAT_MAX:
 	STAT_DENIED <<=1
-print(hex(STAT_DENIED))
+assert STAT_DENIED<2**64
 
 def external_path(path : str) -> str:
 	'''
@@ -24,7 +25,7 @@ def external_path(path : str) -> str:
 def make_stat(*,st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,st_atime,st_mtime,st_ctime) -> os.stat_result:
 	return os.stat_result((st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,st_atime,st_mtime,st_ctime))
 
-if os.name=='nt':
+if sys.platform == 'win32':
 	import ctypes.wintypes as wintypes
 	UNKNOWN_REPARSE_TAG = 0x10  # reserved value in microsoft
 	FILE_ATTRIBUTE_DIRECTORY     = 0x00000010
@@ -101,6 +102,9 @@ if os.name=='nt':
 			)
 			st_file_attributes = data.dwFileAttributes
 			st_reparse_tag     = UNKNOWN_REPARSE_TAG if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) else 0
+
+		assert stat.st_mode<2**64 and stat.st_ino<2**64 and stat.st_dev<2**64 and stat.st_nlink<2**64 and stat.st_uid<2**64 and stat.st_gid<2**64 and \
+			stat.st_size<2**64 and stat.st_atime<2**64 and stat.st_mtime<2**64 and stat.st_ctime<2**64 , stat
 
 		# для IO_REPARSE_TAG_WCI_LINK_1 и IO_REPARSE_TAG_LX_SYMLINK сбросить STAT.S_IFWHT(0xffff) и установить STAT.S_IFLNK
 		if st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT and st_reparse_tag in (IO_REPARSE_TAG_WCI_LINK_1,IO_REPARSE_TAG_LX_SYMLINK):
@@ -195,9 +199,12 @@ if os.name=='nt':
 else:
 	def os_stat(path : str) -> os.stat_result:
 		try:
-			return os.stat(external_path(path),follow_symlinks=False)
+			stat = os.stat(external_path(path),follow_symlinks=False)
 		except Exception:
 			return make_stat(st_mode=STAT_DENIED,st_ino=0,st_dev=0,st_nlink=0,st_uid=0,st_gid=0,st_size=0,st_atime=0,st_mtime=0,st_ctime=0)
+		assert stat.st_mode<2**64 and stat.st_ino<2**64 and stat.st_dev<2**64 and stat.st_nlink<2**64 and stat.st_uid<2**64 and stat.st_gid<2**64 and \
+			stat.st_size<2**64 and stat.st_atime<2**64 and stat.st_mtime<2**64 and stat.st_ctime<2**64 , stat
+		return stat
 	def os_readlink(path: str) -> str:
 		return os.readlink(path)
 
@@ -234,15 +241,9 @@ def stat_eq(stat : os.stat_result, ostat : os.stat_result) -> bool:
 	if not STAT.S_ISDIR(stat.st_mode) and stat.st_mtime != ostat.st_mtime:
 		#if VERBOSE>=2: print('st_mtime')
 		return False
-	if os.name!='nt' and stat.st_blocks != ostat.st_blocks: # type: ignore[attr-defined]
-		#if VERBOSE>=2: print('st_blocks')
-		return False
-	if os.name!='nt' and stat.st_blksize != ostat.st_blksize: # type: ignore[attr-defined]
-		#if VERBOSE>=2: print('st_blksize')
-		return False
 	return True
 
-if os.name == 'nt':
+if sys.platform == 'win32':
 	def get_username_by_uid(uid : int) -> str:
 		return 'dummy'
 	def get_groupname_by_gid(gid : int) -> str:

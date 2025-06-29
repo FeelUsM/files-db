@@ -11,6 +11,7 @@ import subprocess
 import yaml
 import socket
 from pprint import pprint
+import sys
 
 from my_stat import get_username_by_uid, get_groupname_by_gid, stat_eq, os_readlink, os_stat, STAT_DENIED, external_path, make_stat
 
@@ -75,7 +76,7 @@ def internal_path(path : str) -> str:
 	path = path1
 	if path[-1]==os.sep:
 		path = path[:-1]
-	if os.name=='nt':
+	if sys.platform == 'win32':
 		path = os.sep+path
 	return path
 
@@ -115,7 +116,7 @@ def is_file (mode : int) -> bool: return STAT.S_ISREG(mode)
 def is_other(mode : int) -> bool: return STAT.S_ISCHR(mode) or STAT.S_ISBLK(mode) or\
 					STAT.S_ISFIFO(mode) or STAT.S_ISSOCK(mode) or\
 					STAT.S_ISDOOR(mode) or STAT.S_ISPORT(mode) or\
-					STAT.S_ISWHT(mode) or mode&STAT_DENIED
+					STAT.S_ISWHT(mode) or bool(mode&STAT_DENIED)
 def simple_type(mode : int) -> int:
 	typ = TLINK if is_link(mode) else\
 		TDIR if is_dir(mode) else\
@@ -169,7 +170,7 @@ class filesdb:
 				self.last_notification = time()
 				sep = kwargs['sep'] if 'sep' in kwargs else ' '
 				message = sep.join(str(x) for x in args)
-				if os.name=='nt':
+				if sys.platform == 'win32':
 					import plyer # type: ignore
 					from plyer import notification
 					notification.notify(
@@ -270,8 +271,6 @@ class filesdb:
 				st_atime   REAL,
 				st_mtime   REAL,
 				st_ctime   REAL,
-				st_blocks  INTEGER,
-				st_blksize INTEGER,
 				
 				data       TEXT, /* 
 					для файлов - хэш, 
@@ -317,8 +316,6 @@ class filesdb:
 				st_atime     REAL,
 				st_mtime     REAL,
 				st_ctime     REAL,
-				st_blocks    INTEGER,
-				st_blksize   INTEGER,
 
 				data         TEXT,    /* старая запись из stat */
 
@@ -521,34 +518,26 @@ class filesdb:
 		по fid-у заполняет stat-поля в stat
 		'''
 		if cursor is None: cursor = self.CUR
-		if os.name=='nt':
-			cursor.execute('''UPDATE stat SET
-				st_mode=?,st_ino=?,st_dev=?,st_nlink=?,st_uid=?,st_gid=?,st_size=?,
-				st_atime=?,st_mtime=?,st_ctime=? WHERE id = ?''',
-				(stat.st_mode,stat.st_ino,stat.st_dev - (2**64 if stat.st_dev >= 2**63 else 0),stat.st_nlink,stat.st_uid,stat.st_gid,stat.st_size,
-				stat.st_atime,stat.st_mtime,stat.st_ctime, fid)
-			)
-		else:
-			cursor.execute('''UPDATE stat SET
-				st_mode=?,st_ino=?,st_dev=?,st_nlink=?,st_uid=?,st_gid=?,st_size=?,
-				st_atime=?,st_mtime=?,st_ctime=?,st_blocks=?,st_blksize=? WHERE id = ?''',
-				(stat.st_mode,stat.st_ino,stat.st_dev,stat.st_nlink,stat.st_uid,stat.st_gid,stat.st_size,
-				stat.st_atime,stat.st_mtime,stat.st_ctime,stat.st_blocks,stat.st_blksize, fid) # type: ignore[attr-defined]
-			)
+		cursor.execute('''UPDATE stat SET
+			st_mode=?,st_ino=?,st_dev=?,st_nlink=?,st_uid=?,st_gid=?,st_size=?,
+			st_atime=?,st_mtime=?,st_ctime=? WHERE id = ?''',
+			(stat.st_mode,stat.st_ino,stat.st_dev,stat.st_nlink,stat.st_uid,stat.st_gid,stat.st_size,
+			stat.st_atime,stat.st_mtime,stat.st_ctime, fid)
+		)
 	def get_stat(self : Self, fid : int, cursor : Optional[sqlite3.Cursor] =None) -> os.stat_result:
 		'''
 		по fid-у возвращает stat-поля из stat в виде объекта
 		'''
 		if cursor is None: cursor = self.CUR
 		(st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,
-			st_atime,st_mtime,st_ctime,st_blocks,st_blksize) = \
+			st_atime,st_mtime,st_ctime) = \
 		cursor.execute('''SELECT
 			st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,
-			st_atime,st_mtime,st_ctime,st_blocks,st_blksize
+			st_atime,st_mtime,st_ctime
 			FROM stat WHERE id = ?''',(fid,)
 		).fetchone()
-		return make_dict(st_mode=st_mode,st_ino=st_ino,st_dev=st_dev+(2**64 if os.name=='nt' and st_dev<0 else 0),st_nlink=st_nlink,st_uid=st_uid,st_gid=st_gid,st_size=st_size,
-						   st_atime=st_atime,st_mtime=st_mtime,st_ctime=st_ctime,st_blocks=st_blocks,st_blksize=st_blksize)
+		return make_stat(st_mode=st_mode,st_ino=st_ino,st_dev=st_dev,st_nlink=st_nlink,st_uid=st_uid,st_gid=st_gid,st_size=st_size,
+						   st_atime=st_atime,st_mtime=st_mtime,st_ctime=st_ctime)
 
 	# --------------------
 	# инициализация БД
@@ -732,10 +721,10 @@ class filesdb:
 			cursor.execute('''INSERT INTO hist (
 					parent_id, name,
 					id, type, event_type,
-					st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,st_atime,st_mtime,st_ctime,st_blocks,st_blksize,
+					st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,st_atime,st_mtime,st_ctime,
 					data,
 					time,static_found
-				) VALUES (-1,'',?,?,?,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,NULL,?,?)''',
+				) VALUES (-1,'',?,?,?,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,NULL,?,?)''',
 						   (fid,typ,etyp,ltime,static_found))
 		else:
 			(otyp,) = cursor.execute('SELECT type FROM dirs WHERE id = ?',(fid,)).fetchone()
@@ -746,11 +735,11 @@ class filesdb:
 			# просто часть данных копируем а часть заполняем вручную
 			cursor.execute('''INSERT INTO hist (parent_id, name, id, type, event_type,
 				st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,
-				st_atime,st_mtime,st_ctime,st_blocks,st_blksize,data,
+				st_atime,st_mtime,st_ctime,data,
 				time,static_found)
 				SELECT t1.parent_id, t1.name, ?, ?, ?,
 				t2.st_mode,t2.st_ino,t2.st_dev,t2.st_nlink,t2.st_uid,t2.st_gid,t2.st_size,
-				t2.st_atime,t2.st_mtime,t2.st_ctime,t2.st_blocks,t2.st_blksize,t2.data,
+				t2.st_atime,t2.st_mtime,t2.st_ctime,t2.data,
 				?,?
 				FROM dirs AS t1
 				JOIN stat AS t2
@@ -1500,7 +1489,9 @@ class filesdb:
 			observer.start()
 			return observer
 		observer = observe(self.ROOT_DIRS)
-		self.notify(0,"All started...", threading.current_thread().name, datetime.fromtimestamp(time()))
+		self.notify(0,
+			f"Observer '{Observer.__name__}' started...", # type: ignore[attr-defined]
+			 threading.current_thread().name, datetime.fromtimestamp(time()))
 
 
 		def keyboard_monitor() -> None:
@@ -1704,13 +1695,13 @@ class filesdb:
 
 			n = self.CUR.execute('''SELECT data, 
 				st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,
-				st_atime,st_mtime,st_ctime,st_blocks,st_blksize,
+				st_atime,st_mtime,st_ctime,
 				type
 				FROM hist WHERE id = ? ORDER BY time DESC LIMIT 1''',(fid,)).fetchone()
 			if n is not None:
 				data = n[0] if n[0]!='' and n[0]!=-1 else None
-				stat = make_dict(st_mode=n[1],st_ino=n[2],st_dev=n[3],st_nlink=n[4],st_uid=n[5],st_gid=n[6],st_size=n[7],
-				st_atime=n[8],st_mtime=n[9],st_ctime=n[10],st_blocks=n[11],st_blksize=n[12]) if n[1]!=-1 else None
+				stat = make_stat(st_mode=n[1],st_ino=n[2],st_dev=n[3],st_nlink=n[4],st_uid=n[5],st_gid=n[6],st_size=n[7],
+				st_atime=n[8],st_mtime=n[9],st_ctime=n[10]) if n[1]!=-1 else None
 				typ = n[13] if n[13]!=-1 else None
 			else:
 				data = None
@@ -2039,7 +2030,7 @@ class filesdb:
 	@staticmethod
 	def get_root_dirs() -> List[str]:
 		'''определяет, за какими папками надо на самом деле следить, если указано следить за всей файловой системой'''
-		if os.name=='nt': return ['C:\\']
+		if sys.platform == 'win32': return ['C:\\']
 		dirs = []
 		for rd in os.listdir(path='/'):
 			if rd in ['media','cdrom','mnt','proc','sys','dev','run']:
