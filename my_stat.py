@@ -25,7 +25,7 @@ def external_path(path : str) -> str:
 	return path
 
 class Stat:
-	__slots__ = ['st_mode','st_ino','st_dev','st_nlink','st_uid','st_gid','st_size','st_atime','st_mtime','st_ctime','disk_size','sys_attrs']
+	__slots__ = ['st_mode','st_ino','st_dev','st_nlink','st_uid','st_gid','st_size','atime','mtime','ctime','disk_size','sys_attrs','stat_time']
 	st_mode   : int # unix format
 	st_ino    : None|str
 	st_dev    : None|str
@@ -78,7 +78,10 @@ class Stat:
 		self.disk_size = disk_size
 		self.sys_attrs = sys_attrs
 		self.stat_time = stat_time
-		assert self.st_mode<2**64 and self.st_nlink<2**64 and self.st_size<2**64 and self.disk_size<2**64, self
+		assert self.st_mode  <2**63 if self.st_mode   is not None else True
+		assert self.st_nlink <2**63 if self.st_nlink  is not None else True
+		assert self.st_size  <2**63 if self.st_size   is not None else True
+		assert self.disk_size<2**63 if self.disk_size is not None else True
 
 	def __eq__(stat : Self, ostat : object) -> bool:
 		'''
@@ -86,8 +89,8 @@ class Stat:
 		если это директории: должно совпадать всё кроме access_time и modification_time
 		иначе: должно совпадать всё кроме access_time
 		'''
-        if not isinstance(ostat, MyClass):
-            raise TypeError(f'{type(self)} == {type(ostat)}') # fucking mypy can't assume that Stat is not a subclass of object
+		if not isinstance(ostat, Stat):
+			raise TypeError(f'{type(stat)} == {type(ostat)}') # fucking mypy can't assume that Stat is not a subclass of object
 		if stat.st_mode  != ostat.st_mode:			return False
 		if stat.st_ino   != ostat.st_ino:			return False
 		if stat.st_dev   != ostat.st_dev:			return False
@@ -316,14 +319,14 @@ else:
 
 
 if sys.platform == 'win32':
-	def get_username_by_uid(uid : int) -> str:
+	def get_username_by_uid(uid : str) -> str:
 		return 'dummy'
-	def get_groupname_by_gid(gid : int) -> str:
+	def get_groupname_by_gid(gid : str) -> str:
 		return 'dummy'
 else:
 	import pwd
 	import grp
-	def get_username_by_uid(uid : int) -> str:
-		return pwd.getpwuid(uid).pw_name # type: ignore[attr-defined]
-	def get_groupname_by_gid(gid : int) -> str:
-		return grp.getgrgid(gid).gr_name # type: ignore[attr-defined]
+	def get_username_by_uid(uid : str) -> str:
+		return pwd.getpwuid(int(uid)).pw_name # type: ignore[attr-defined]
+	def get_groupname_by_gid(gid : str) -> str:
+		return grp.getgrgid(int(gid)).gr_name # type: ignore[attr-defined]

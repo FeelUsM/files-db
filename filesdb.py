@@ -68,9 +68,9 @@ def search(name):
     	print('codecs serch result is None for',name)
 
 codecs.register(search)
-sys.stdout.reconfigure(encoding='utf8-custom')
-sys.stderr.reconfigure(encoding='utf8-custom')
-
+# error: Item "TextIO" of "TextIO | Any" has no attribute "reconfigure"  [union-attr]
+sys.stdout.reconfigure(encoding='utf8-custom') # type: ignore[union-attr]
+sys.stderr.reconfigure(encoding='utf8-custom') # type: ignore[union-attr]
 
 def decode_row_factory(cursor, row):
     # применить декодер к каждому элементу
@@ -595,7 +595,7 @@ class filesdb:
 			(bits&STAT_MODIFIED and not bits&HASH_MODIFIED and  n[1]&STAT_MODIFIED) or (not bits&STAT_MODIFIED and bits&HASH_MODIFIED and n[1]&HASH_MODIFIED) ):
 				# not n[1]&PRE_ROOT_DIR_MODIF and (bits&(STAT_MODIFIED|HASH_MODIFIED))&~n[1]&(STAT_MODIFIED|HASH_MODIFIED)
 			cursor.execute('UPDATE dirs SET modified = 1 WHERE id = ?',(fid,))
-			self.set_modified(n[0], cursor=cursor)
+			self.set_modified(n[0], bits, cursor=cursor)
 
 	def update_stat(self : Self, fid : int, stat : Stat, cursor : Optional[sqlite3.Cursor] =None) -> None:
 		'''
@@ -616,7 +616,7 @@ class filesdb:
 		по fid-у возвращает stat-поля из stat в виде объекта
 		'''
 		if cursor is None: cursor = self.CUR
-		return tuple2stat(cursor.execute(f'SELECT {FIELDS_STAT} FROM stat WHERE id = ?',(fid,)).fetchone())
+		return tuple2stat(*cursor.execute(f'SELECT {FIELDS_STAT} FROM stat WHERE id = ?',(fid,)).fetchone())
 
 	# --------------------
 	# инициализация БД
@@ -1525,6 +1525,7 @@ class filesdb:
 
 		self.q = Queue()
 
+		self_q = self.q
 		class MyEventHandler(FileSystemEventHandler):
 			def on_any_event(self : Self, event: FileSystemEvent) -> None:
 				if event.event_type=='closed_no_write':
@@ -1533,7 +1534,7 @@ class filesdb:
 					pass
 				else:
 					#print('put',event.event_type,event.src_path)
-					self.q.put(event)
+					self_q.put(event)
 		def observe(root_dirs : List[str]):
 			event_handler = MyEventHandler()  # Создаем обработчик с временным значением shared_data
 			observer = Observer()
@@ -1661,7 +1662,7 @@ class filesdb:
 				path	:str,
 				ids		:List[int], # path в формате списка id-ов
 				data	:str|None, # hash/link
-				stat	:os.stat_result|None,
+				stat	:Stat|None,
 				count_static:int, # количество изменений, найденных статически
 				count	:int, # количество изменений этого файла за указанный интервал
 				count_all : int, # количество изменений за всё время
@@ -1677,7 +1678,7 @@ class filesdb:
 			self.path	:str = path
 			self.ids	:List[int] = ids
 			self.data	:str|None = data
-			self.stat	:os.stat_result|None = stat
+			self.stat	:Stat|None = stat
 			self.count_static:int = count_static
 			self.count	:int = count
 			self.count_all :int = count_all
@@ -1853,13 +1854,13 @@ class filesdb:
 			if info.stat is None:
 				out_data.append('????-??-?? ??:??:??.??????')	
 			else:
-				out_data.append(str(datetime.fromtimestamp(info.stat.st_mtime)))
+				out_data.append(str(datetime.fromtimestamp(info.stat.mtime)))
 
 		# uid, gid, size
 		if info_lev==2:
 			if info.stat is not None:
-				out_data.append(get_username_by_uid(info.stat.st_uid) )
-				out_data.append(get_groupname_by_gid(info.stat.st_gid))
+				out_data.append(get_username_by_uid(info.stat.st_uid) if info.stat.st_uid is not None else '?')
+				out_data.append(get_groupname_by_gid(info.stat.st_gid)if info.stat.st_gid is not None else '?')
 				out_data.append(str(info.stat.st_size))
 			else:
 				out_data.append('user-?')
@@ -2106,10 +2107,10 @@ class filesdb:
 			server_in - имя UNIX сокета или FIFO чтобы отправлять управляющие команды
 		'''
 		self.VERBOSE = 0.5
-		self.keyboard_thr = None
-		self.commit_thr = None
+		#self.keyboard_thr = None
+		#self.commit_thr = None
 		self.last_notification = time()
-		self.q = None
+		#self.q = None
 		self.username = 'feelus' # todo получать из аргументов или из среды
 
 		try:
