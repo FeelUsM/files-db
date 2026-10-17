@@ -33,8 +33,9 @@ NO_TAGS_KEY = "-"
 SEPARATOR_KEY = "-" * 10
 INLINE_LIMIT = 200
 
-BASE_FIELDS = ("type", "dev", "ino", "size", "mtime", "ctime", "btime", "uid", "gid", "mode")
-FIELD_ORDER = BASE_FIELDS + ("target",)
+FIELD_ORDER = ("type", "dev", "ino", "size", "total", "mtime", "ctime", "btime", "uid", "gid", "mode", "target")
+OPTIONAL_FIELDS = ("total", "target")  # есть не у всех объектов; null в set значит «поля нет»
+CHANGE_OPS = ("change", "change_d")  # change_d: то же, что change, но для папок
 INHERITED = ("dev", "uid", "gid")
 
 TAG_RE = re.compile(r"^[\w.]+$")
@@ -377,39 +378,79 @@ def stat_record(path):
 # ---------------------------------------------------------------- прогресс
 
 
-def render_progress(done, total, width=30):
-	if total is None:
-		return f"сканирую: {done}"
-	ratio = 1.0 if total <= 0 else min(1.0, done / total)
-	filled = int(width * ratio)
-	return f"[{'#' * filled}{'-' * (width - filled)}] {int(ratio * 100):3d}% {done}/{total}"
+ETA_MIN_ELAPSED = 1.0  # раньше оценка оставшегося времени слишком неточна и только мельтешит
+ETA_MIN_RATIO = 0.01
+
+
+def format_duration(seconds):
+	s = int(seconds)
+	h, rem = divmod(s, 3600)
+	m, sec = divmod(rem, 60)
+	return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def render_progress(done, total, width=30, elapsed=None, label="", finished=False):
+	"""Строка прогресса: [####----]  50% 5/10  прошло 0:05, осталось ~0:05"""
+	prefix = f"{label}: " if label else ""
+	if done is None:  # счётчика нет, этап один длинный вызов
+		text = f"{prefix}готово" if finished else f"{label}…"
+	elif total is None:
+		text = f"{prefix}{done}"
+	else:
+		ratio = 1.0 if total <= 0 else min(1.0, done / total)
+		filled = int(width * ratio)
+		text = f"{prefix}[{'#' * filled}{'-' * (width - filled)}] {int(ratio * 100):3d}% {done}/{total}"
+	if elapsed is not None:
+		text += f"  прошло {format_duration(elapsed)}"
+		if total and done and not finished and done < total and elapsed >= ETA_MIN_ELAPSED and done / total >= ETA_MIN_RATIO:
+			text += f", осталось ~{format_duration(elapsed * (total - done) / done)}"
+	return text
 
 
 class Progress:
-	def __init__(self, total=None, stream=None, enabled=None, width=30, interval=0.1):
+	"""Прогресс одного этапа. counted=False: этап без счётчика (одна долгая операция)."""
+
+	def __init__(self, label="", total=None, stream=None, enabled=None, width=30, interval=0.1, counted=True, clock=time.monotonic):
+		self.label = label
 		self.total = total
 		self.stream = stream if stream is not None else sys.stderr
 		self.enabled = self.stream.isatty() if enabled is None else enabled
 		self.width = width
 		self.interval = interval
-		self.done = 0
+		self.clock = clock
+		self.start = clock()
+		self.done = 0 if (counted or total is not None) else None
 		self.suspended = False
+		self.finished = False
 		self._last = None
 		self._len = 0
 		self._drawn = False
+
+	def __enter__(self):
+		if self.enabled:
+			self._draw()
+		return self
+
+	def __exit__(self, exc_type, exc, tb):
+		if exc_type is None:
+			self.finish()
+		elif self.enabled and self._drawn:
+			self.stream.write("\n")
+			self.stream.flush()
+		return False
 
 	def update(self, done):
 		self.done = done
 		if not self.enabled or self.suspended:
 			return
-		now = time.monotonic()
+		now = self.clock()
 		if self._last is not None and now - self._last < self.interval:
 			return
 		self._last = now
 		self._draw()
 
 	def _draw(self):
-		line = render_progress(self.done, self.total, self.width)
+		line = render_progress(self.done, self.total, self.width, self.clock() - self.start, self.label, self.finished)
 		self._len = max(self._len, len(line))
 		self.stream.write("\r" + line.ljust(self._len))
 		self.stream.flush()
@@ -431,10 +472,34 @@ class Progress:
 		self.suspended = True
 
 	def finish(self):
+		if self.total is not None and self.done is not None:
+			self.total = self.done  # оценка могла не совпасть: этап закончен, показываем факт
+		self.finished = True
 		if self.enabled and not self.suspended:
 			self._draw()
 			self.stream.write("\n")
 			self.stream.flush()
+
+
+class NullProgress:
+	"""Заглушка, когда прогресс не нужен."""
+
+	def update(self, done):
+		pass
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc):
+		return False
+
+
+def null_stage(label="", total=None, counted=True):
+	return NullProgress()
+
+
+def make_stage(label="", total=None, counted=True):
+	return Progress(label, total, counted=counted)
 
 
 class WarningPrinter:
@@ -522,6 +587,28 @@ def scan_fs(root, rules, progress=None, on_warning=None):
 	return flat, warnings
 
 
+def add_dir_totals(flat, stage=None):
+	"""Добавляет папкам поле total: суммарный размер обычных файлов во всём поддереве."""
+	stage = stage or null_stage
+	dirs = [p for p, r in flat.items() if r["type"] == "d"]
+	totals = dict.fromkeys(dirs, 0)
+	with stage("размеры папок", total=len(flat) + len(dirs)) as progress:
+		done = 0
+		for p, r in flat.items():
+			if r["type"] == "f":
+				totals[p.rpartition("/")[0] or ROOT_KEY] += r["size"]
+			done += 1
+			progress.update(done)
+		for p in sorted(dirs, key=lambda d: -1 if d == ROOT_KEY else d.count("/"), reverse=True):
+			if p != ROOT_KEY:
+				totals[p.rpartition("/")[0] or ROOT_KEY] += totals[p]
+			done += 1
+			progress.update(done)
+	for p in dirs:
+		flat[p] = ordered({**flat[p], "total": totals[p]})
+	return flat
+
+
 # ---------------------------------------------------------------- слепок: плоский вид <-> дерево
 
 
@@ -543,12 +630,14 @@ def flatten(tree):
 	return flat
 
 
-def build_tree(flat):
+def build_tree(flat, progress=None):
 	if ROOT_KEY not in flat:
 		raise ChkanError("в слепке нет корня")
 	nodes = {ROOT_KEY: dict(flat[ROOT_KEY])}
 	paths = sorted((p for p in flat if p != ROOT_KEY), key=lambda p: (p.count("/"), p))
-	for path in paths:
+	for i, path in enumerate(paths, 2):  # корень уже посчитан
+		if progress is not None:
+			progress.update(i)
 		parent, _, name = path.rpartition("/")
 		parent = parent or ROOT_KEY
 		if parent not in flat:
@@ -569,14 +658,14 @@ def make_head(root, now, rules):
 	}
 
 
-def make_snapshot(root, now, rules, flat):
+def make_snapshot(root, now, rules, flat, progress=None):
 	head = make_head(root, now, rules)
 	return {
 		"format": FORMAT,
 		"root": root,
 		"taken_at": head["taken_at"],
 		"exclude": head["exclude"],
-		"tree": build_tree(flat),
+		"tree": build_tree(flat, progress),
 	}
 
 
@@ -616,6 +705,69 @@ def parse_size(value):
 	return int(value.split("=", 1)[0].replace("_", ""))
 
 
+def format_delta(n):
+	"""+25_573_854=+24M / -1_024=-1.0K / 0=0B"""
+	text = format_size(abs(n))
+	if n == 0:
+		return text
+	sign = "+" if n > 0 else "-"
+	num, human = text.split("=")
+	return f"{sign}{num}={sign}{human}"
+
+
+def format_total_pair(pair):
+	"""[было, стало] -> [было, стало, на_сколько_изменилось] строками; None (поля не было) остаётся null."""
+	a, b = pair
+	fa = None if a is None else format_size(a)
+	fb = None if b is None else format_size(b)
+	if a is None or b is None:
+		return [fa, fb]
+	return [fa, fb, format_delta(b - a)]
+
+
+def parse_total_pair(pair):
+	try:
+		if len(pair) not in (2, 3):
+			raise ValueError("ожидалось 2 или 3 значения")
+		a, b = (None if x is None else parse_size(x) for x in pair[:2])
+		if len(pair) == 3 and a is not None and b is not None and parse_size(pair[2]) != b - a:
+			raise ValueError("разница не равна стало минус было")
+	except (ValueError, TypeError, AttributeError) as e:
+		raise DiffError(f"плохой суммарный размер {pair!r}: {e}")
+	return [a, b]
+
+
+def _format_record(rec):
+	if isinstance(rec.get("total"), int):
+		rec = dict(rec)
+		rec["total"] = format_size(rec["total"])
+	return rec
+
+
+def _parse_record(rec):
+	if isinstance(rec.get("total"), str):
+		rec = dict(rec)
+		try:
+			rec["total"] = parse_size(rec["total"])
+		except ValueError as e:
+			raise DiffError(f"плохой суммарный размер {rec['total']!r}: {e}")
+	return rec
+
+
+def _format_set(changes):
+	if "total" in changes:
+		changes = dict(changes)
+		changes["total"] = format_total_pair(changes["total"])
+	return changes
+
+
+def _parse_set(changes):
+	if "total" in changes:
+		changes = dict(changes)
+		changes["total"] = parse_total_pair(changes["total"])
+	return changes
+
+
 # ---------------------------------------------------------------- diff: вычисление
 
 
@@ -644,40 +796,55 @@ def same_identity(old, new):
 	return True
 
 
-def make_ops(old_flat, new_flat, old_under, new_under):
+def make_ops(old_flat, new_flat, old_under, new_under, stage=None):
+	stage = stage or null_stage
+	common = sorted(old_flat.keys() & new_flat.keys())
+	removed = sorted(old_flat.keys() - new_flat.keys())
+	added = sorted(new_flat.keys() - old_flat.keys())
 	ops = []
-	for p in sorted(old_flat.keys() & new_flat.keys()):
-		ch = record_changes(old_flat[p], new_flat[p])
-		if ch:
-			ops.append({"op": "change", "path": p, "set": ch})
+	with stage("diff: сравнение", total=len(common) + len(removed) + 2 * len(added)) as progress:
+		done = 0
+		for p in common:
+			old, new = old_flat[p], new_flat[p]
+			ch = record_changes(old, new)
+			if ch:
+				kind = "change_d" if old["type"] == "d" and new["type"] == "d" else "change"
+				ops.append({"op": kind, "path": p, "set": ch})
+			done += 1
+			progress.update(done)
 
-	plain_removed, plain_added = [], []
-	for p in sorted(old_flat.keys() - new_flat.keys()):
-		if new_under(p):
-			ops.append({"op": "remove_scan", "path": p, "old": old_flat[p]})
-		else:
-			plain_removed.append(p)
-	for p in sorted(new_flat.keys() - old_flat.keys()):
-		if old_under(p):
-			ops.append({"op": "add_scan", "path": p, "new": new_flat[p]})
-		else:
-			plain_added.append(p)
+		plain_removed, plain_added = [], []
+		for p in removed:
+			if new_under(p):
+				ops.append({"op": "remove_scan", "path": p, "old": old_flat[p]})
+			else:
+				plain_removed.append(p)
+			done += 1
+			progress.update(done)
+		for p in added:
+			if old_under(p):
+				ops.append({"op": "add_scan", "path": p, "new": new_flat[p]})
+			else:
+				plain_added.append(p)
+			done += 1
+			progress.update(done)
 
-	by_id = {}
-	for p in plain_removed:
-		r = old_flat[p]
-		by_id.setdefault((r["type"], r["dev"], r["ino"]), []).append(p)
-	used = set()
-	moved_to = {}
-	for p in plain_added:
-		r = new_flat[p]
-		cands = [c for c in by_id.get((r["type"], r["dev"], r["ino"]), []) if c not in used and same_identity(old_flat[c], r)]
-		if not cands:
-			continue
-		base = p.rpartition("/")[2]
-		pick = next((c for c in cands if c.rpartition("/")[2] == base), cands[0])
-		used.add(pick)
-		moved_to[p] = pick
+		by_id = {}
+		for p in plain_removed:
+			r = old_flat[p]
+			by_id.setdefault((r["type"], r["dev"], r["ino"]), []).append(p)
+		used = set()
+		moved_to = {}
+		for p in plain_added:
+			r = new_flat[p]
+			cands = [c for c in by_id.get((r["type"], r["dev"], r["ino"]), []) if c not in used and same_identity(old_flat[c], r)]
+			if cands:
+				base = p.rpartition("/")[2]
+				pick = next((c for c in cands if c.rpartition("/")[2] == base), cands[0])
+				used.add(pick)
+				moved_to[p] = pick
+			done += 1
+			progress.update(done)
 
 	for p in plain_removed:
 		if p not in used:
@@ -696,10 +863,15 @@ def make_ops(old_flat, new_flat, old_under, new_under):
 
 
 def op_to_node(op):
+	"""Операция -> узел для diff-файла; суммарные размеры папок пишутся строками."""
 	node = {"op": op["op"]}
-	for k in ("new", "old", "from", "set"):
+	for k in ("new", "old"):
 		if k in op:
-			node[k] = op[k]
+			node[k] = _format_record(op[k])
+	if "from" in op:
+		node["from"] = op["from"]
+	if "set" in op:
+		node["set"] = _format_set(op["set"])
 	return node
 
 
@@ -730,27 +902,35 @@ def build_ch(nodes):
 	return emit(trie)
 
 
-def build_diff_flat(old_head, old_flat, new_head, new_flat, rules, root):
+def build_diff_flat(old_head, old_flat, new_head, new_flat, rules, root, stage=None):
+	stage = stage or null_stage
 	old_under = make_excluder(old_head["exclude"])
 	new_under = make_excluder(new_head["exclude"])
-	ops = make_ops(old_flat, new_flat, old_under, new_under)
+	ops = make_ops(old_flat, new_flat, old_under, new_under, stage)
 	resolver = rules.resolver()
 
 	groups, scan_nodes = {}, {}
-	for op in ops:
-		node = op_to_node(op)
-		if op["op"] in ("add_scan", "remove_scan"):
-			scan_nodes[op["path"]] = node
-		else:
-			groups.setdefault(resolver.tags(op["path"]), {})[op["path"]] = node
-
 	sizes = {}
-	for path, rec in old_flat.items():
-		if rec["type"] == "f" and not new_under(path):
-			sizes.setdefault(resolver.tags(path), [0, 0])[0] += rec["size"]
-	for path, rec in new_flat.items():
-		if rec["type"] == "f" and not old_under(path):
-			sizes.setdefault(resolver.tags(path), [0, 0])[1] += rec["size"]
+	with stage("diff: группы и размеры", total=len(ops) + len(old_flat) + len(new_flat)) as progress:
+		done = 0
+		for op in ops:
+			node = op_to_node(op)
+			if op["op"] in ("add_scan", "remove_scan"):
+				scan_nodes[op["path"]] = node
+			else:
+				groups.setdefault(resolver.tags(op["path"]), {})[op["path"]] = node
+			done += 1
+			progress.update(done)
+		for path, rec in old_flat.items():
+			if rec["type"] == "f" and not new_under(path):
+				sizes.setdefault(resolver.tags(path), [0, 0])[0] += rec["size"]
+			done += 1
+			progress.update(done)
+		for path, rec in new_flat.items():
+			if rec["type"] == "f" and not old_under(path):
+				sizes.setdefault(resolver.tags(path), [0, 0])[1] += rec["size"]
+			done += 1
+			progress.update(done)
 
 	keys = set(groups) | {t for t, (a, b) in sizes.items() if a != b}
 	entries = []
@@ -810,9 +990,13 @@ def iter_nodes(ch, prefix=""):
 
 def node_to_op(path, node):
 	op = {"op": node["op"], "path": path}
-	for k in ("new", "old", "from", "set"):
+	for k in ("new", "old"):
 		if k in node:
-			op[k] = node[k]
+			op[k] = _parse_record(node[k])
+	if "from" in node:
+		op["from"] = node["from"]
+	if "set" in node:
+		op["set"] = _parse_set(node["set"])
 	return op
 
 
@@ -826,18 +1010,47 @@ def diff_ops(diff):
 	return ops
 
 
-def count_objects(diff):
-	"""(без тегов, с отслеживаемыми тегами): узлы с op до разделителя."""
-	untagged = tracked = 0
+COUNT_KEYS = ("add", "remove", "change", "move", "change_d")
+
+
+def _count_group(group, counts):
+	for _path, node in iter_nodes(group.get("ch", {})):
+		kind = node["op"]
+		if kind in CHANGE_OPS:
+			counts["change_d" if kind == "change_d" else "change"] += 1
+		elif kind in ("add", "remove", "move"):
+			counts[kind] += 1  # add_scan и remove_scan не считаем
+
+
+def count_ops(diff):
+	"""[(метка, счётчики)]: без тегов, каждая отслеживаемая комбинация, не отслеживаемые комбинации."""
+	untagged = dict.fromkeys(COUNT_KEYS, 0)
+	ignored = dict.fromkeys(COUNT_KEYS, 0)
+	rows = []
+	after_separator = False
 	for key, group in diff.get("groups", {}).items():
 		if key == SEPARATOR_KEY:
-			break
-		n = sum(1 for _ in iter_nodes(group.get("ch", {})))
-		if key == NO_TAGS_KEY:
-			untagged += n
+			after_separator = True
+			continue
+		if not isinstance(group, dict):
+			continue
+		if after_separator:
+			_count_group(group, ignored)
+		elif key == NO_TAGS_KEY:
+			_count_group(group, untagged)
 		else:
-			tracked += n
-	return untagged, tracked
+			counts = dict.fromkeys(COUNT_KEYS, 0)
+			_count_group(group, counts)
+			rows.append((key, counts))
+	return [("без тегов", untagged)] + rows + [("с не отслеживаемыми тэгами", ignored)]
+
+
+def format_summary(diff):
+	"""+созданные -удалённые ~изменённые(не папки) ->перемещённые d~изменённые папки"""
+	return [
+		f"{label}: +{c['add']} -{c['remove']} ~{c['change']} ->{c['move']} d~{c['change_d']}"
+		for label, c in count_ops(diff)
+	]
 
 
 def invert_op(op):
@@ -847,8 +1060,8 @@ def invert_op(op):
 			return {"op": kind.replace("add", "remove"), "path": path, "old": op["new"]}
 		if kind in ("remove", "remove_scan"):
 			return {"op": kind.replace("remove", "add"), "path": path, "new": op["old"]}
-		if kind == "change":
-			return {"op": "change", "path": path, "set": {k: [b, a] for k, (a, b) in op["set"].items()}}
+		if kind in CHANGE_OPS:
+			return {"op": kind, "path": path, "set": {k: [b, a] for k, (a, b) in op["set"].items()}}
 		if kind == "move":
 			inv = {"op": "move", "path": op["from"], "from": path}
 			if op.get("set"):
@@ -864,18 +1077,20 @@ def _apply_set(rec, changes, path, strict):
 	for k, (a, b) in changes.items():
 		if strict and rec.get(k) != a:
 			raise DiffError(f"{path}: поле {k} равно {rec.get(k)!r}, а в diff ожидалось {a!r}")
-		if b is None and k == "target":
+		if b is None and k in OPTIONAL_FIELDS:
 			out.pop(k, None)
 		else:
 			out[k] = b
 	return ordered(out)
 
 
-def apply_ops(flat, ops, strict=True):
+def apply_ops(flat, ops, strict=True, progress=None):
 	"""Применяет операции атомарно: сначала все удаления, потом вставки."""
 	removals, changes, inserts = [], [], []
 	try:
-		for op in ops:
+		for i, op in enumerate(ops, 1):
+			if progress is not None:
+				progress.update(i)
 			kind, path = op["op"], op["path"]
 			if kind in ("remove", "remove_scan"):
 				if path not in flat:
@@ -885,7 +1100,7 @@ def apply_ops(flat, ops, strict=True):
 				removals.append(path)
 			elif kind in ("add", "add_scan"):
 				inserts.append((path, ordered(op["new"])))
-			elif kind == "change":
+			elif kind in CHANGE_OPS:
 				if path not in flat:
 					raise DiffError(f"{path}: нечего менять")
 				changes.append((path, _apply_set(flat[path], op["set"], path, strict)))
@@ -916,6 +1131,30 @@ def apply_ops(flat, ops, strict=True):
 			raise DiffError(f"{p}: уже существует")
 		result[p] = rec
 	return result
+
+
+class _Offset:
+	"""Прогресс со сдвигом: общий бар этапа из нескольких проходов."""
+
+	def __init__(self, progress, offset):
+		self.progress, self.offset = progress, offset
+
+	def update(self, done):
+		self.progress.update(self.offset + done)
+
+
+def verify_restore(diff, new_head, new_flat, prev_head, prev_flat, stage=None):
+	"""Из нового слепка и diff (в том виде, как он записан на диск) должен получиться предыдущий."""
+	stage = stage or null_stage
+	if diff["to"] != new_head or diff["from"] != prev_head:
+		return False
+	ops = [invert_op(o) for o in diff_ops(diff)]
+	with stage("проверка: откат", total=len(ops) + len(prev_flat)) as progress:
+		restored = apply_ops(new_flat, ops, True, progress)
+		if restored != prev_flat:
+			return False
+		build_tree(restored, _Offset(progress, len(ops)))  # заодно проверяет, что у всех есть родитель
+	return True
 
 
 def apply_diff(snapshot, diff, backward=False, strict=True):
@@ -1053,7 +1292,7 @@ def run(root, assume_yes=False, warn_yes=False):
 		prev_flat = flatten(prev["tree"])
 	now, stamp = next_moment(scans[-1] if scans else None)
 
-	progress = Progress(total=len(prev_flat) if prev_flat is not None else None)
+	progress = Progress("сканирование", total=len(prev_flat) if prev_flat is not None else None)
 	printer = WarningPrinter(progress)
 	flat, warnings = scan_fs(root, rules, progress, printer)
 	progress.finish()
@@ -1068,19 +1307,28 @@ def run(root, assume_yes=False, warn_yes=False):
 			print("Отмена: ничего не сохранено.")
 			return 1
 
-	snapshot = make_snapshot(root, now, rules, flat)
-	write_text_atomic(os.path.join(changes, scan_name(stamp)), dumps_snapshot(snapshot))
+	add_dir_totals(flat, stage=make_stage)
+	with make_stage("слепок: дерево", total=len(flat)) as pr:
+		snapshot = make_snapshot(root, now, rules, flat, pr)
+	with make_stage("слепок: запись", counted=False):
+		write_text_atomic(os.path.join(changes, scan_name(stamp)), dumps_snapshot(snapshot))
 
 	if prev is None:
 		print(f"первый скан сохранён: {len(flat)} объектов ({scan_name(stamp)})")
 		return 0
 
-	diff = build_diff_flat(snapshot_head(prev), prev_flat, snapshot_head(snapshot), flat, rules, root)
+	diff = build_diff_flat(snapshot_head(prev), prev_flat, snapshot_head(snapshot), flat, rules, root, stage=make_stage)
 	diff_path = os.path.join(changes, diff_name(scans[-1], stamp))
-	write_text_atomic(diff_path, dumps_pretty(diff) + "\n")
+	with make_stage("diff: запись", counted=False):
+		write_text_atomic(diff_path, dumps_pretty(diff) + "\n")
 
-	restored = apply_diff(snapshot, read_json(diff_path), backward=True)
-	if not snapshots_equal(restored, prev):
+	with make_stage("проверка: чтение diff", counted=False):
+		written = read_json(diff_path)
+	try:
+		restored_ok = verify_restore(written, snapshot_head(snapshot), flat, snapshot_head(prev), prev_flat, stage=make_stage)
+	except ChkanError as e:
+		raise ChkanError(f"проверка отката не прошла ({e}); предыдущий скан оставлен")
+	if not restored_ok:
 		raise ChkanError(
 			f"предыдущий скан не восстанавливается из нового слепка и {os.path.basename(diff_path)}; "
 			f"предыдущий скан оставлен"
@@ -1088,9 +1336,8 @@ def run(root, assume_yes=False, warn_yes=False):
 	if scans[-1] != scans[0]:
 		os.remove(os.path.join(changes, scan_name(scans[-1])))
 
-	untagged, tracked = count_objects(diff)
-	print(f"без тегов: {untagged}")
-	print(f"с отслеживаемыми тегами: {tracked}")
+	for line in format_summary(diff):
+		print(line)
 	return 0
 
 

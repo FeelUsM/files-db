@@ -573,7 +573,7 @@ class DiffGrouping(unittest.TestCase):
 		new["dir"] = drec(ino=3, mtime=99)
 		d = diff_between(old, new, TAGS_FOR_DIFF)[2]
 		node = d["groups"]["tag"]["ch"]["dir"]
-		self.assertEqual(node["op"], "change")
+		self.assertEqual(node["op"], "change_d")
 		self.assertIn("ch", node)
 
 	def test_single_object_is_written_as_path(self):
@@ -623,13 +623,16 @@ class DiffGrouping(unittest.TestCase):
 		self.assertEqual(list(d["to"]), ["taken_at", "exclude"])
 		self.assertTrue(d["from"]["taken_at"].endswith("+02:00"))
 
-	def test_count_objects(self):
-		self.assertEqual(chkan.count_objects(self.diff()), (1, 3))
-
-	def test_ignored_groups_not_counted(self):
-		d = self.diff()
-		untagged, tracked = chkan.count_objects(d)
-		self.assertEqual(untagged + tracked, 4)  # logs (1) не входит
+	def test_summary_lines(self):
+		self.assertEqual(
+			chkan.format_summary(self.diff()),
+			[
+				"без тегов: +0 -0 ~1 ->0 d~0",
+				"photos+tag: +1 -0 ~0 ->0 d~0",
+				"tag: +0 -0 ~1 ->1 d~0",
+				"с не отслеживаемыми тэгами: +0 -0 ~1 ->0 d~0",
+			],
+		)
 
 	def test_old_diff_not_regrouped_by_other_rules(self):
 		d = diff_between(self.flat_old(), self.flat_new(), TAGS_FOR_DIFF)[2]
@@ -859,6 +862,357 @@ class OldFilesStillRead(unittest.TestCase):
 		self.assertTrue(chkan.snapshots_equal(chkan.apply_diff(a_old, d), b_old))
 
 
+class DirTotals(unittest.TestCase):
+	def flat(self):
+		return {
+			".": drec(ino=1),
+			"a": drec(ino=2),
+			"a/b": drec(ino=3),
+			"a/b/f1": rec(ino=4, size=100),
+			"a/f2": rec(ino=5, size=20),
+			"a/lnk": rec(type="l", ino=6, size=2, target="f2"),
+			"empty": drec(ino=7),
+			"top": rec(ino=8, size=3),
+		}
+
+	def test_totals_are_sums_of_regular_files(self):
+		flat = chkan.add_dir_totals(self.flat())
+		self.assertEqual(flat["a/b"]["total"], 100)
+		self.assertEqual(flat["a"]["total"], 120)  # симлинк не считается
+		self.assertEqual(flat["empty"]["total"], 0)
+		self.assertEqual(flat["."]["total"], 123)
+
+	def test_only_directories_get_total(self):
+		flat = chkan.add_dir_totals(self.flat())
+		self.assertNotIn("total", flat["a/b/f1"])
+		self.assertNotIn("total", flat["a/lnk"])
+		self.assertNotIn("total", flat["top"])
+
+	def test_recomputed_not_accumulated(self):
+		flat = chkan.add_dir_totals(self.flat())
+		again = chkan.add_dir_totals(flat)
+		self.assertEqual(again["."]["total"], 123)
+
+	def test_deep_chain(self):
+		flat = {".": drec(ino=1)}
+		path = ""
+		for i in range(30):
+			path = f"{path}/d{i}" if path else f"d{i}"
+			flat[path] = drec(ino=10 + i)
+		flat[path + "/f"] = rec(ino=99, size=7)
+		flat = chkan.add_dir_totals(flat)
+		self.assertTrue(all(r["total"] == 7 for r in flat.values() if r["type"] == "d"))
+
+	def test_stage_gets_label_and_total(self):
+		seen = []
+
+		def stage(label, total=None, counted=True):
+			seen.append((label, total))
+			return chkan.NullProgress()
+
+		chkan.add_dir_totals(self.flat(), stage=stage)
+		self.assertEqual(seen, [("размеры папок", 8 + 4)])  # все записи + четыре папки
+
+	def test_field_order_and_snapshot_roundtrip(self):
+		flat = chkan.add_dir_totals(self.flat())
+		self.assertEqual(list(flat["a"])[:5], ["type", "dev", "ino", "size", "total"])
+		self.assertEqual(chkan.flatten(chkan.build_tree(flat)), flat)
+
+	def test_scan_then_totals_on_real_fs(self):
+		with tempfile.TemporaryDirectory() as t:
+			for name, data in (("x/a", b"12345"), ("x/y/b", b"123"), ("c", b"1")):
+				path = os.path.join(t, name)
+				os.makedirs(os.path.dirname(path), exist_ok=True)
+				with open(path, "wb") as f:
+					f.write(data)
+			flat, _ = chkan.scan_fs(t, chkan.parse_tags(""))
+			chkan.add_dir_totals(flat)
+		self.assertEqual((flat["x/y"]["total"], flat["x"]["total"], flat["."]["total"]), (3, 8, 9))
+
+
+class SizeFormatsInDiff(unittest.TestCase):
+	def test_delta(self):
+		self.assertEqual(chkan.format_delta(25_573_854), "+25_573_854=+24M")
+		self.assertEqual(chkan.format_delta(-1024), "-1_024=-1.0K")
+		self.assertEqual(chkan.format_delta(0), "0=0B")
+		self.assertEqual(chkan.parse_size("+25_573_854=+24M"), 25_573_854)
+		self.assertEqual(chkan.parse_size("-1_024=-1.0K"), -1024)
+
+	def test_pair_to_triple_and_back(self):
+		triple = chkan.format_total_pair([1000, 1030])
+		self.assertEqual(triple, ["1_000=1000B", "1_030=1.0K", "+30=+30B"])
+		self.assertEqual(chkan.parse_total_pair(triple), [1000, 1030])
+		shrink = chkan.format_total_pair([2048, 1024])
+		self.assertEqual(shrink, ["2_048=2.0K", "1_024=1.0K", "-1_024=-1.0K"])
+		self.assertEqual(chkan.parse_total_pair(shrink), [2048, 1024])
+
+	def test_absent_side_has_no_delta(self):
+		self.assertEqual(chkan.format_total_pair([None, 1030]), [None, "1_030=1.0K"])
+		self.assertEqual(chkan.format_total_pair([5, None]), ["5=5B", None])
+		self.assertEqual(chkan.parse_total_pair([None, "1_030=1.0K"]), [None, 1030])
+
+	def test_bad_pairs(self):
+		for bad in (["1=1B"], ["1=1B", "2=2B", "+5=+5B", "x"], ["1=1B", "2=2B", "+9=+9B"], ["abc", "2=2B"], [[1], 2]):
+			with self.subTest(bad):
+				with self.assertRaises(chkan.DiffError):
+					chkan.parse_total_pair(bad)
+
+
+def dir_diff(old_total, new_total, **extra):
+	old = {".": drec(ino=1), "d": {**drec(ino=2), "total": old_total}}
+	new = {".": drec(ino=1), "d": {**drec(ino=2, **extra), "total": new_total}}
+	if old_total is None:
+		del old["d"]["total"]
+	return old, new
+
+
+class ChangeD(unittest.TestCase):
+	def test_dirs_get_change_d_files_get_change(self):
+		old = {".": drec(ino=1), "d": drec(ino=2), "f": rec(ino=3, size=1)}
+		new = {".": drec(ino=1, mtime=99), "d": drec(ino=2, mtime=99), "f": rec(ino=3, size=2)}
+		ops = chkan.make_ops(old, new, chkan.make_excluder([]), chkan.make_excluder([]))
+		self.assertEqual(sorted((o["op"], o["path"]) for o in ops), [("change", "f"), ("change_d", "."), ("change_d", "d")])
+
+	def test_type_change_is_plain_change(self):
+		old = {".": drec(ino=1), "x": drec(ino=2)}
+		new = {".": drec(ino=1), "x": rec(ino=2, size=5)}
+		(op,) = chkan.make_ops(old, new, chkan.make_excluder([]), chkan.make_excluder([]))
+		self.assertEqual(op["op"], "change")
+
+	def test_total_triple_in_file_and_ints_after_read(self):
+		old, new = dir_diff(1000, 1030, mtime=50)
+		a, b, d, _ = diff_between(old, new)
+		node = d["groups"]["-"]["ch"]["d"]
+		self.assertEqual(node["op"], "change_d")
+		self.assertEqual(node["set"]["total"], ["1_000=1000B", "1_030=1.0K", "+30=+30B"])
+		self.assertEqual(node["set"]["mtime"], [10, 50])
+		(op,) = chkan.diff_ops(roundtrip(d))
+		self.assertEqual(op["set"]["total"], [1000, 1030])
+
+	def test_file_size_pairs_stay_numbers(self):
+		old = {".": drec(ino=1), "f": rec(ino=3, size=1000)}
+		new = {".": drec(ino=1), "f": rec(ino=3, size=1030)}
+		d = diff_between(old, new)[2]
+		self.assertEqual(d["groups"]["-"]["ch"]["f"]["set"]["size"], [1000, 1030])
+
+	def test_added_and_removed_dirs_carry_formatted_total(self):
+		old = {".": drec(ino=1)}
+		new = {".": drec(ino=1), "d": {**drec(ino=2), "total": 2048}}
+		a, b, d, _ = diff_between(old, new)
+		self.assertEqual(d["groups"]["-"]["ch"]["d"]["new"]["total"], "2_048=2.0K")
+		d = roundtrip(d)
+		self.assertEqual(chkan.apply_diff(b, d, backward=True), a)
+		self.assertTrue(chkan.snapshots_equal(chkan.apply_diff(a, d), b))
+		rd = diff_between(new, old)[2]
+		self.assertEqual(rd["groups"]["-"]["ch"]["d"]["old"]["total"], "2_048=2.0K")
+
+	def test_reversible_with_totals(self):
+		for old_total, new_total in ((1000, 1030), (2048, 5), (None, 77), (77, None)):
+			with self.subTest((old_total, new_total)):
+				old, new = dir_diff(old_total, new_total, mtime=50)
+				if new_total is None:
+					del new["d"]["total"]
+				a, b, d, _ = diff_between(old, new)
+				d = roundtrip(d)
+				self.assertEqual(chkan.apply_diff(b, d, backward=True), a)
+				self.assertTrue(chkan.snapshots_equal(chkan.apply_diff(a, d), b))
+
+	def test_old_scan_without_totals_gives_none_to_value(self):
+		old, new = dir_diff(None, 500)
+		d = diff_between(old, new)[2]
+		self.assertEqual(d["groups"]["-"]["ch"]["d"]["set"], {"total": [None, "500=500B"]})
+
+	def test_dir_becomes_file_drops_total(self):
+		old = {".": drec(ino=1), "x": {**drec(ino=2), "total": 9}}
+		new = {".": drec(ino=1), "x": rec(ino=2, size=5)}
+		a, b, d, _ = diff_between(old, new)
+		d = roundtrip(d)
+		self.assertEqual(d["groups"]["-"]["ch"]["x"]["op"], "change")
+		self.assertEqual(chkan.apply_diff(b, d, backward=True), a)
+		self.assertTrue(chkan.snapshots_equal(chkan.apply_diff(a, d), b))
+
+	def test_plain_change_on_dir_still_applies(self):
+		old, new = dir_diff(1000, 1030, mtime=50)
+		a, b, d, _ = diff_between(old, new)
+		d = roundtrip(d)
+		d["groups"]["-"]["ch"]["d"]["op"] = "change"  # как в старых diff-ах
+		self.assertEqual(chkan.apply_diff(b, d, backward=True), a)
+
+	def test_invert_keeps_change_d(self):
+		op = {"op": "change_d", "path": "d", "set": {"total": [1, 2]}}
+		self.assertEqual(chkan.invert_op(op), {"op": "change_d", "path": "d", "set": {"total": [2, 1]}})
+
+	def test_wrong_delta_in_file_is_rejected(self):
+		old, new = dir_diff(1000, 1030, mtime=50)
+		a, b, d, _ = diff_between(old, new)
+		d = roundtrip(d)
+		d["groups"]["-"]["ch"]["d"]["set"]["total"][2] = "+31=+31B"
+		with self.assertRaises(chkan.DiffError):
+			chkan.diff_ops(d)
+
+	def test_strict_catches_wrong_old_total(self):
+		old, new = dir_diff(1000, 1030, mtime=50)
+		a, b, d, _ = diff_between(old, new)
+		d = roundtrip(d)
+		d["groups"]["-"]["ch"]["d"]["set"]["total"] = ["1_001=1001B", "1_030=1.0K", "+29=+29B"]
+		with self.assertRaises(chkan.DiffError):
+			chkan.apply_diff(a, d)  # в слепке a у папки 1000, а diff ждёт 1001
+		# откат такой порчи молча даёт другой слепок: поэтому chkan.py сверяет результат с предыдущим сканом
+		self.assertNotEqual(chkan.apply_diff(b, d, backward=True), a)
+
+
+class Summary(unittest.TestCase):
+	def diff_with(self, groups, scan=None):
+		d = {"format": chkan.FORMAT, "from": {}, "to": {}, "groups": groups}
+		if scan:
+			d["scan"] = scan
+		return d
+
+	def test_each_kind_counted_separately(self):
+		ch = {
+			"a": {"op": "add", "new": {}},
+			"b": {"op": "add", "new": {}},
+			"c": {"op": "remove", "old": {}},
+			"d": {"op": "change", "set": {}},
+			"e": {"op": "move", "from": "x"},
+			"f": {"op": "change_d", "set": {}, "ch": {"g": {"op": "change", "set": {}}}},
+		}
+		lines = chkan.format_summary(self.diff_with({"-": {"size": [], "ch": ch}, "-" * 10: 0}))
+		self.assertEqual(lines[0], "без тегов: +2 -1 ~2 ->1 d~1")
+
+	def test_tracked_lines_in_diff_order_and_ignored_aggregated(self):
+		node = lambda op: {"op": op}
+		groups = {
+			"-": {"ch": {"a": node("add")}},
+			"b+t": {"ch": {"x": node("remove")}},
+			"a": {"size": ["0=0B", "0=0B"]},  # только размер: строка с нулями
+			"-" * 10: 0,
+			"ign1": {"ch": {"y": node("move"), "z": node("add")}},
+			"ign2": {"ch": {"w": node("change_d")}},
+		}
+		self.assertEqual(
+			chkan.format_summary(self.diff_with(groups)),
+			[
+				"без тегов: +1 -0 ~0 ->0 d~0",
+				"b+t: +0 -1 ~0 ->0 d~0",
+				"a: +0 -0 ~0 ->0 d~0",
+				"с не отслеживаемыми тэгами: +1 -0 ~0 ->1 d~1",
+			],
+		)
+
+	def test_scan_ops_not_counted(self):
+		scan = {"ch": {"x": {"op": "add_scan", "new": {}}, "y": {"op": "remove_scan", "old": {}}}}
+		lines = chkan.format_summary(self.diff_with({"-" * 10: 0}, scan))
+		self.assertEqual(lines, ["без тегов: +0 -0 ~0 ->0 d~0", "с не отслеживаемыми тэгами: +0 -0 ~0 ->0 d~0"])
+
+	def test_empty_diff(self):
+		self.assertEqual(len(chkan.format_summary(self.diff_with({"-" * 10: 0}))), 2)
+
+	def test_nested_nodes_all_counted(self):
+		ch = {"d": {"op": "change_d", "ch": {"e": {"ch": {"f": {"op": "add"}, "g": {"op": "add"}}}}}}
+		lines = chkan.format_summary(self.diff_with({"t": {"ch": ch}, "-" * 10: 0}))
+		self.assertEqual(lines[1], "t: +2 -0 ~0 ->0 d~1")
+
+
+class TimedProgress(unittest.TestCase):
+	def test_duration(self):
+		f = chkan.format_duration
+		self.assertEqual((f(0), f(5), f(65), f(3599), f(3600), f(3725.9)), ("0:00", "0:05", "1:05", "59:59", "1:00:00", "1:02:05"))
+
+	def test_render_with_eta(self):
+		line = chkan.render_progress(25, 100, 10, elapsed=10, label="этап")
+		self.assertEqual(line, "этап: [##--------]  25% 25/100  прошло 0:10, осталось ~0:30")
+
+	def test_eta_waits_for_enough_data(self):
+		self.assertNotIn("осталось", chkan.render_progress(1, 20000, 10, elapsed=5))  # меньше 1% сделано
+		self.assertNotIn("осталось", chkan.render_progress(50, 100, 10, elapsed=0.4))  # прошло меньше секунды
+		self.assertIn("осталось ~0:01", chkan.render_progress(50, 100, 10, elapsed=1.0))
+
+	def test_build_tree_progress_reaches_total(self):
+		flat = {".": drec(ino=1), "a": drec(ino=2), "a/b": rec(ino=3)}
+		seen = []
+
+		class P:
+			def update(self, n):
+				seen.append(n)
+
+		chkan.build_tree(flat, P())
+		self.assertEqual(seen[-1], len(flat))
+
+	def test_render_without_eta_when_nothing_done_or_finished(self):
+		self.assertNotIn("осталось", chkan.render_progress(0, 100, 10, elapsed=3))
+		self.assertNotIn("осталось", chkan.render_progress(100, 100, 10, elapsed=3))
+		self.assertNotIn("осталось", chkan.render_progress(5, None, elapsed=3))
+		self.assertNotIn("осталось", chkan.render_progress(50, 100, 10, elapsed=3, finished=True))
+
+	def test_render_uncounted_stage(self):
+		self.assertEqual(chkan.render_progress(None, None, label="запись"), "запись…")
+		self.assertEqual(chkan.render_progress(None, None, elapsed=7, label="запись", finished=True), "запись: готово  прошло 0:07")
+
+	def clocked(self, **kw):
+		t = [100.0]
+		buf = io.StringIO()
+		p = chkan.Progress(stream=buf, enabled=True, width=10, interval=0, clock=lambda: t[0], **kw)
+		return p, buf, t
+
+	def test_progress_uses_clock_for_elapsed_and_eta(self):
+		p, buf, t = self.clocked(label="размеры", total=100)
+		t[0] += 20
+		p.update(50)
+		self.assertIn("размеры: [#####-----]  50% 50/100  прошло 0:20, осталось ~0:20", buf.getvalue())
+
+	def test_finish_shows_elapsed_only_and_actual_count(self):
+		p, buf, t = self.clocked(label="скан", total=100)
+		t[0] += 5
+		p.update(80)
+		p.finish()
+		last = buf.getvalue().splitlines()[-1].split("\r")[-1].strip()
+		self.assertEqual(last, "скан: [##########] 100% 80/80  прошло 0:05")
+		self.assertTrue(buf.getvalue().endswith("\n"))
+
+	def test_uncounted_context_manager(self):
+		p, buf, t = self.clocked(label="запись", counted=False)
+		with p:
+			t[0] += 3
+		out = buf.getvalue()
+		self.assertIn("запись…", out)
+		self.assertTrue(out.splitlines()[-1].strip().endswith("запись: готово  прошло 0:03"))
+
+	def test_context_manager_on_error_does_not_claim_done(self):
+		p, buf, t = self.clocked(label="x", total=10)
+		with self.assertRaises(RuntimeError):
+			with p:
+				raise RuntimeError
+		self.assertNotIn("готово", buf.getvalue())
+		self.assertNotIn("100%", buf.getvalue())
+		self.assertTrue(buf.getvalue().endswith("\n"))
+
+	def test_each_stage_has_its_own_line(self):
+		buf = io.StringIO()
+		for label in ("один", "два"):
+			with chkan.Progress(label, total=2, stream=buf, enabled=True, interval=0) as pr:
+				pr.update(1)
+				pr.update(2)
+		lines = [l.split("\r")[-1].strip() for l in buf.getvalue().split("\n") if l]
+		self.assertEqual(len(lines), 2)
+		self.assertTrue(lines[0].startswith("один:") and lines[1].startswith("два:"))
+
+	def test_silent_stage_when_not_tty(self):
+		buf = io.StringIO()
+		with chkan.Progress("тихо", total=2, stream=buf) as pr:
+			pr.update(2)
+		self.assertEqual(buf.getvalue(), "")
+
+	def test_null_stage(self):
+		with chkan.null_stage("x", 5) as pr:
+			pr.update(1)
+
+	def test_make_stage_returns_progress(self):
+		st = chkan.make_stage("x", total=3, counted=True)
+		self.assertIsInstance(st, chkan.Progress)
+		self.assertEqual((st.label, st.total), ("x", 3))
+
+
 class ProgressBar(unittest.TestCase):
 	def test_render_with_total(self):
 		self.assertEqual(chkan.render_progress(50, 100, 10), "[#####-----]  50% 50/100")
@@ -869,7 +1223,8 @@ class ProgressBar(unittest.TestCase):
 		self.assertTrue(chkan.render_progress(1, 0, 10).startswith("[##########]"))
 
 	def test_render_without_total(self):
-		self.assertEqual(chkan.render_progress(7, None), "сканирую: 7")
+		self.assertEqual(chkan.render_progress(7, None, label="сканирование"), "сканирование: 7")
+		self.assertEqual(chkan.render_progress(7, None), "7")
 
 	def test_writes_when_enabled(self):
 		buf = io.StringIO()
@@ -1153,22 +1508,28 @@ class EndToEnd(unittest.TestCase):
 		self.assertIn("no_exclude", err)
 		self.assertEqual(self.scans(), [])
 
-	def test_two_lines_of_output(self):
-		self.tags("data/\t# tracked\n")
+	def test_console_counters(self):
+		self.tags("data/\t# tracked\n// logs ниже\n# noisy(ignore)\nnoise/\t# noisy\n")
 		self.write("data/a.txt", b"1")
+		self.write("data/old.txt", b"old")
 		self.write("loose.txt", b"1")
+		self.write("noise/n.txt", b"1")
 		self.assertEqual(self.step()[0], 0)
-		self.write("data/b.txt", b"22")
-		self.write("loose2.txt", b"1")
+		self.write("data/new.txt", b"newer!!")
+		os.rename(os.path.join(self.root, "data/a.txt"), os.path.join(self.root, "data/renamed.txt"))
+		os.remove(os.path.join(self.root, "data/old.txt"))
+		self.write("loose.txt", b"changed!")
+		self.write("noise/n.txt", b"1234567")
 		code, out, _ = self.step()
 		self.assertEqual(code, 0)
-		lines = out.splitlines()
-		self.assertEqual(len(lines), 2)
-		self.assertRegex(lines[0], r"^без тегов: \d+$")
-		self.assertRegex(lines[1], r"^с отслеживаемыми тегами: \d+$")
-		d = chkan.read_json(os.path.join(self.changes, self.diffs()[0]))
-		self.assertEqual(chkan.count_objects(d), tuple(int(re.findall(r"\d+", l)[0]) for l in lines))
-		self.assertGreaterEqual(int(re.findall(r"\d+", lines[1])[0]), 2)  # data/b.txt и сама папка data
+		self.assertEqual(
+			out.splitlines(),
+			[
+				"без тегов: +0 -0 ~1 ->0 d~1",  # loose.txt; корень (поменялся total)
+				"tracked: +1 -1 ~0 ->1 d~1",  # new.txt, old.txt, a.txt->renamed.txt; папка data
+				"с не отслеживаемыми тэгами: +0 -0 ~1 ->0 d~1",  # noise/n.txt и папка noise (total)
+			],
+		)
 
 	def test_scan_retention_and_reconstruction(self):
 		self.tags("data/\t# tracked\n.cache/\t# exclude\n")
@@ -1220,7 +1581,8 @@ class EndToEnd(unittest.TestCase):
 		d = chkan.read_json(os.path.join(self.changes, self.diffs()[0]))
 		scan_ops = sorted((o["op"], o["path"]) for o in chkan.diff_ops(d) if o["op"].endswith("_scan"))
 		self.assertEqual(scan_ops, [("add_scan", "a"), ("add_scan", "a/x"), ("remove_scan", "b"), ("remove_scan", "b/y")])
-		self.assertEqual(chkan.count_objects(d)[1], 0)
+		for _label, c in chkan.count_ops(d):
+			self.assertEqual((c["add"], c["remove"], c["move"]), (0, 0, 0))  # *_scan не считаются
 
 	def test_tags_change_does_not_rewrite_old_diffs(self):
 		self.tags("")
@@ -1257,7 +1619,7 @@ class EndToEnd(unittest.TestCase):
 		self.step()
 		self.write("c", b"1")
 		middle = self.scans()[-1]
-		with mock.patch.object(chkan, "apply_diff", lambda snapshot, diff, backward=False, strict=True: snapshot):
+		with mock.patch.object(chkan, "apply_ops", lambda flat, ops, strict=True, progress=None: flat):
 			code, _, err = self.step()
 		self.assertEqual(code, 2)
 		self.assertIn("не восстанавливается", err)
@@ -1301,12 +1663,90 @@ class EndToEnd(unittest.TestCase):
 		scan = chkan.read_json(os.path.join(self.changes, self.scans()[0]))
 		self.assertEqual(sorted(chkan.flatten(scan["tree"])), [".", "a"])
 
-	def test_idle_run_gives_zero_objects_except_root_noise(self):
+	def record_stages(self):
+		stages = []
+
+		def fake(label="", total=None, counted=True):
+			stages.append((label, total, counted))
+			return chkan.NullProgress()
+
+		return stages, mock.patch.object(chkan, "make_stage", fake)
+
+	def test_first_run_stages(self):
+		self.write("a/b", b"1")
+		stages, patch = self.record_stages()
+		with patch:
+			self.assertEqual(self.run_chkan("-y")[0], 0)
+		self.assertEqual([s[0] for s in stages], ["размеры папок", "слепок: дерево", "слепок: запись"])
+		self.assertEqual(stages[1][1], 3)  # корень, a, a/b
+		self.assertFalse(stages[2][2])  # запись: без счётчика
+
+	def test_second_run_has_separate_stage_for_each_step(self):
+		self.write("a/b", b"1")
+		self.step()
+		self.write("a/c", b"22")
+		stages, patch = self.record_stages()
+		with patch:
+			self.assertEqual(self.step()[0], 0)
+		self.assertEqual(
+			[s[0] for s in stages],
+			[
+				"размеры папок",
+				"слепок: дерево",
+				"слепок: запись",
+				"diff: сравнение",
+				"diff: группы и размеры",
+				"diff: запись",
+				"проверка: чтение diff",
+				"проверка: откат",
+			],
+		)
+		by = {s[0]: s for s in stages}
+		self.assertEqual(by["diff: группы и размеры"][1], 3 + 3 + 4)  # 3 операции (корень, a, a/c), 3 старые записи, 4 новые
+		self.assertEqual(by["проверка: откат"][1], 3 + 3)  # три операции + записей в прошлом слепке
+
+	def test_scan_files_have_dir_totals_only_on_dirs(self):
+		self.write("a/b", b"12345")
+		self.write("c", b"1")
+		self.step()
+		scan = chkan.read_json(os.path.join(self.changes, self.scans()[0]))
+		flat = chkan.flatten(scan["tree"])
+		self.assertEqual((flat["."]["total"], flat["a"]["total"]), (6, 5))
+		self.assertNotIn("total", flat["a/b"])
+		self.assertNotIn("total", flat["c"])
+		self.assertEqual(list(flat["a"])[:5], ["type", "dev", "ino", "size", "total"])
+
+	def test_diff_shows_totals_of_all_ancestors(self):
+		self.write("a/b/f", b"12345")
+		self.step()
+		self.write("a/b/f", b"123456789012")
+		self.step()
+		d = chkan.read_json(os.path.join(self.changes, self.diffs()[0]))
+		ops = {o["path"]: o for o in chkan.diff_ops(d)}
+		self.assertEqual(ops["a/b/f"]["op"], "change")
+		self.assertEqual(ops["a/b/f"]["set"]["size"], [5, 12])
+		for path in (".", "a", "a/b"):
+			self.assertEqual(ops[path]["op"], "change_d", path)
+			self.assertEqual(ops[path]["set"]["total"], [5, 12])
+		text = read_text(os.path.join(self.changes, self.diffs()[0]))
+		self.assertIn('"total": ["5=5B", "12=12B", "+7=+7B"]', text)
+
+	def test_unchanged_dir_total_not_in_diff(self):
+		self.write("a/f", b"12345")
+		self.write("b/g", b"1")
+		self.step()
+		self.write("b/g", b"22")
+		self.step()
+		d = chkan.read_json(os.path.join(self.changes, self.diffs()[0]))
+		paths = {o["path"] for o in chkan.diff_ops(d)}
+		self.assertEqual(paths, {".", "b", "b/g"})  # a не менялась
+
+	def test_idle_run_gives_zero_counters(self):
 		self.write("a", b"1")
 		self.step()
 		code, out, _ = self.step()
 		self.assertEqual(code, 0)
-		self.assertEqual(out.splitlines(), ["без тегов: 0", "с отслеживаемыми тегами: 0"])
+		self.assertEqual(out.splitlines(), ["без тегов: +0 -0 ~0 ->0 d~0", "с не отслеживаемыми тэгами: +0 -0 ~0 ->0 d~0"])
 
 
 if __name__ == "__main__":
