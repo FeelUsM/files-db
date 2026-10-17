@@ -3,6 +3,7 @@
 
 import contextlib
 import datetime
+import errno
 import io
 import json
 import os
@@ -826,6 +827,105 @@ class ProgressBar(unittest.TestCase):
 		self.assertEqual(buf.getvalue().count("\r"), 1)
 
 
+class WarningPrinting(unittest.TestCase):
+	def printer(self):
+		buf = io.StringIO()
+		progress = chkan.Progress(stream=buf, enabled=False)
+		return chkan.WarningPrinter(progress), progress, buf
+
+	def feed(self, n):
+		p, progress, buf = self.printer()
+		for i in range(n):
+			p(f"w{i}: нет доступа")
+		progress.finish()
+		p.finish()
+		return buf.getvalue()
+
+	def test_each_of_first_ten_is_printed_at_once(self):
+		p, _, buf = self.printer()
+		for i in range(10):
+			p(f"w{i}")
+			self.assertEqual(buf.getvalue().splitlines()[-1], f"Предупреждение: не прочитано w{i}")
+			self.assertTrue(buf.getvalue().endswith("\n"))
+		p.finish()
+		self.assertEqual(len(buf.getvalue().splitlines()), 10)
+		self.assertNotIn("и ещё", buf.getvalue())
+
+	def test_eleventh_prints_prefix_without_number(self):
+		p, _, buf = self.printer()
+		for i in range(11):
+			p(f"w{i}")
+		self.assertTrue(buf.getvalue().endswith("Предупреждение: не прочитано w9\n... и ещё "))
+		for i in range(11, 15):
+			p(f"w{i}")
+		self.assertTrue(buf.getvalue().endswith("... и ещё "))  # до конца скана больше ничего
+
+	def test_number_is_appended_after_scan(self):
+		self.assertTrue(self.feed(15).endswith("... и ещё 5\n"))
+		self.assertTrue(self.feed(11).endswith("... и ещё 1\n"))
+		self.assertEqual(self.feed(12).count("Предупреждение"), 10)
+
+	def test_nothing_extra_for_ten_or_fewer(self):
+		self.assertEqual(self.feed(0), "")
+		self.assertNotIn("и ещё", self.feed(10))
+		self.assertEqual(len(self.feed(3).splitlines()), 3)
+
+
+class ProgressWithMessages(unittest.TestCase):
+	def make(self):
+		buf = io.StringIO()
+		return chkan.Progress(total=10, stream=buf, enabled=True, width=10, interval=0), buf
+
+	def test_message_clears_bar_and_redraws(self):
+		p, buf = self.make()
+		p.update(5)
+		p.message("hello")
+		out = buf.getvalue()
+		self.assertRegex(out, r"\r +\rhello\n")
+		self.assertGreater(out.rindex("50%"), out.index("hello\n"))
+
+	def test_suspend_stops_drawing_and_keeps_open_line(self):
+		p, buf = self.make()
+		p.update(5)
+		p.message("... и ещё ", newline=False)
+		p.suspend()
+		size = len(buf.getvalue())
+		p.update(8)
+		p.finish()
+		self.assertEqual(len(buf.getvalue()), size)
+		p.message("3")
+		self.assertTrue(buf.getvalue().endswith("... и ещё 3\n"))
+
+	def test_message_without_bar_when_disabled(self):
+		buf = io.StringIO()
+		p = chkan.Progress(stream=buf, enabled=False)
+		p.message("x")
+		self.assertEqual(buf.getvalue(), "x\n")
+
+	def test_scan_fs_reports_warnings_immediately(self):
+		with tempfile.TemporaryDirectory() as t:
+			for n in ("ok", "bad1", "bad2"):
+				with open(os.path.join(t, n), "w") as f:
+					f.write("x")
+			real = chkan.stat_record
+			seen = []
+
+			def fake(path):
+				if os.path.basename(path).startswith("bad"):
+					raise OSError(errno.EACCES, "Permission denied", path)
+				return real(path)
+
+			def on_warning(text):
+				seen.append((text, "ok" in [os.path.basename(x) for x in os.listdir(t)]))
+
+			with mock.patch.object(chkan, "stat_record", fake):
+				flat, warnings = chkan.scan_fs(t, chkan.parse_tags(""), None, on_warning)
+			self.assertEqual(sorted(w for w, _ in seen), ["bad1: Permission denied", "bad2: Permission denied"])
+			self.assertEqual(sorted(warnings), sorted(w for w, _ in seen))
+			self.assertIn("ok", flat)
+			self.assertNotIn("bad1", flat)
+
+
 # ------------------------------------------------------------ chkan.py целиком
 
 
@@ -870,6 +970,86 @@ class EndToEnd(unittest.TestCase):
 
 	def diffs(self):
 		return [f for f in self.files() if f.startswith("diff_")]
+
+	def fail_on_bad(self):
+		real = chkan.stat_record
+
+		def fake(path):
+			if os.path.basename(path).startswith("bad"):
+				raise OSError(errno.EACCES, "Permission denied", path)
+			return real(path)
+
+		return mock.patch.object(chkan, "stat_record", fake)
+
+	def test_warnings_default_answer_is_no(self):
+		self.write("ok", b"1")
+		self.write("bad1", b"1")
+		with self.fail_on_bad(), mock.patch("builtins.input", return_value="") as inp:
+			code, out, err = self.run_chkan("-y")
+		self.assertEqual(code, 1)
+		inp.assert_called_once()
+		self.assertIn("(1)", inp.call_args.args[0])
+		self.assertIn("[y/N]", inp.call_args.args[0])
+		self.assertEqual(self.scans(), [])
+		self.assertIn("Предупреждение: не прочитано bad1: Permission denied", err)
+		self.assertIn("Отмена", out)
+
+	def test_warnings_explicit_no_and_eof(self):
+		self.write("bad1", b"1")
+		for kw in ({"return_value": "n"}, {"side_effect": EOFError}):
+			with self.fail_on_bad(), mock.patch("builtins.input", **kw):
+				code, _, _ = self.run_chkan("-y")
+			self.assertEqual(code, 1)
+			self.assertEqual(self.scans(), [])
+
+	def test_warnings_yes_answer_continues(self):
+		self.write("ok", b"1")
+		self.write("bad1", b"1")
+		with self.fail_on_bad(), mock.patch("builtins.input", return_value="y"):
+			code, _, _ = self.run_chkan("-y")
+		self.assertEqual(code, 0)
+		self.assertEqual(len(self.scans()), 1)
+
+	def test_warn_yes_flag_skips_question(self):
+		self.write("ok", b"1")
+		self.write("bad1", b"1")
+		with self.fail_on_bad(), mock.patch("builtins.input", side_effect=AssertionError("не должен спрашивать")):
+			code, _, err = self.run_chkan("-y", "-w")
+		self.assertEqual(code, 0)
+		self.assertEqual(len(self.scans()), 1)
+		self.assertIn("bad1", err)
+		with self.fail_on_bad(), mock.patch("builtins.input", side_effect=AssertionError("не должен спрашивать")):
+			self.clock += datetime.timedelta(minutes=1)
+			code, _, _ = self.run_chkan("-y", "--warn-yes")
+		self.assertEqual(code, 0)
+
+	def test_no_warnings_no_question(self):
+		self.write("ok", b"1")
+		with mock.patch("builtins.input", side_effect=AssertionError("не должен спрашивать")):
+			code, _, err = self.run_chkan("-y")
+		self.assertEqual(code, 0)
+		self.assertNotIn("Предупреждение", err)
+
+	def test_declined_warnings_keep_previous_scan_and_write_no_diff(self):
+		self.write("ok", b"1")
+		self.assertEqual(self.step()[0], 0)
+		before = self.files()
+		self.write("bad1", b"1")
+		with self.fail_on_bad(), mock.patch("builtins.input", return_value="n"):
+			code, _, _ = self.step()
+		self.assertEqual(code, 1)
+		self.assertEqual(self.files(), before)
+
+	def test_many_warnings_output_shape(self):
+		for i in range(12):
+			self.write(f"bad{i:02d}", b"1")
+		with self.fail_on_bad():
+			code, _, err = self.run_chkan("-y", "-w")
+		self.assertEqual(code, 0)
+		lines = err.splitlines()
+		self.assertEqual(len(lines), 11)
+		self.assertTrue(all(l.startswith("Предупреждение: не прочитано bad") for l in lines[:10]))
+		self.assertEqual(lines[10], "... и ещё 2")
 
 	def test_asks_and_cancel(self):
 		with mock.patch("builtins.input", return_value="n"):

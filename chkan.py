@@ -3,7 +3,7 @@
 
 Запуск из папки, в которой лежит (или будет создана) ./.changes/:
 
-	python3 chkan.py [-y] [папка]
+	python3 chkan.py [-y] [-w] [папка]
 
 root = папка, в которой лежит .changes/TAGS.txt (по умолчанию текущая).
 Файлы в .changes/:
@@ -26,6 +26,7 @@ from collections import namedtuple
 
 CHANGES_DIR = ".changes"
 TAGS_FILE = "TAGS.txt"
+YES_ANSWERS = ("y", "yes", "д", "да")
 FORMAT = 3
 ROOT_KEY = "."
 NO_TAGS_KEY = "-"
@@ -392,12 +393,14 @@ class Progress:
 		self.width = width
 		self.interval = interval
 		self.done = 0
+		self.suspended = False
 		self._last = None
 		self._len = 0
+		self._drawn = False
 
 	def update(self, done):
 		self.done = done
-		if not self.enabled:
+		if not self.enabled or self.suspended:
 			return
 		now = time.monotonic()
 		if self._last is not None and now - self._last < self.interval:
@@ -410,12 +413,50 @@ class Progress:
 		self._len = max(self._len, len(line))
 		self.stream.write("\r" + line.ljust(self._len))
 		self.stream.flush()
+		self._drawn = True
+
+	def message(self, text, newline=True):
+		"""Печатает строку поверх бара: стирает бар, пишет текст, рисует бар заново."""
+		live = self.enabled and not self.suspended
+		if live and self._drawn:
+			self.stream.write("\r" + " " * self._len + "\r")
+			self._drawn = False
+		self.stream.write(text + ("\n" if newline else ""))
+		self.stream.flush()
+		if live and newline:
+			self._draw()
+
+	def suspend(self):
+		"""Бар больше не рисуется (нужно, когда в текущей строке оставлено незаконченное сообщение)."""
+		self.suspended = True
 
 	def finish(self):
-		if self.enabled:
+		if self.enabled and not self.suspended:
 			self._draw()
 			self.stream.write("\n")
 			self.stream.flush()
+
+
+class WarningPrinter:
+	"""Первые LIMIT предупреждений сразу, на следующем «... и ещё », число дописывается в finish()."""
+
+	LIMIT = 10
+
+	def __init__(self, progress):
+		self.progress = progress
+		self.count = 0
+
+	def __call__(self, text):
+		self.count += 1
+		if self.count <= self.LIMIT:
+			self.progress.message(f"Предупреждение: не прочитано {text}")
+		elif self.count == self.LIMIT + 1:
+			self.progress.message("... и ещё ", newline=False)
+			self.progress.suspend()
+
+	def finish(self):
+		if self.count > self.LIMIT:
+			self.progress.message(str(self.count - self.LIMIT))
 
 
 # ---------------------------------------------------------------- скан
@@ -429,9 +470,17 @@ def ordered(rec):
 	return out
 
 
-def scan_fs(root, rules, progress=None):
-	"""Возвращает (flat, warnings): flat = {путь: запись}, корень под ключом '.'."""
+def scan_fs(root, rules, progress=None, on_warning=None):
+	"""Возвращает (flat, warnings): flat = {путь: запись}, корень под ключом '.'.
+
+	on_warning(текст) вызывается сразу, как только предупреждение возникло."""
 	warnings = []
+
+	def warn(text):
+		warnings.append(text)
+		if on_warning is not None:
+			on_warning(text)
+
 	try:
 		root_rec = stat_record(root)
 	except OSError as e:
@@ -447,7 +496,7 @@ def scan_fs(root, rules, progress=None):
 			with os.scandir(abs_dir) as it:
 				names = [e.name for e in it]
 		except OSError as e:
-			warnings.append(f"{rel_dir}: {e.strerror}")
+			warn(f"{rel_dir}: {e.strerror}")
 			continue
 		for name in names:
 			if rel_dir == ROOT_KEY and name == CHANGES_DIR:
@@ -462,7 +511,7 @@ def scan_fs(root, rules, progress=None):
 			except FileNotFoundError:
 				continue
 			except OSError as e:
-				warnings.append(f"{rel}: {e.strerror}")
+				warn(f"{rel}: {e.strerror}")
 				continue
 			flat[rel] = ordered(rec)
 			count += 1
@@ -959,7 +1008,7 @@ def next_moment(last_stamp):
 # ---------------------------------------------------------------- основной сценарий
 
 
-def run(root, assume_yes=False):
+def run(root, assume_yes=False, warn_yes=False):
 	changes = os.path.join(root, CHANGES_DIR)
 	if not os.path.isdir(changes):
 		if not assume_yes:
@@ -967,7 +1016,7 @@ def run(root, assume_yes=False):
 				answer = input(f"Папка {changes} не найдена.\nСоздать её и сделать первый скан (может занять время)? [y/N] ")
 			except EOFError:
 				answer = ""
-			if answer.strip().lower() not in ("y", "yes", "д", "да"):
+			if answer.strip().lower() not in YES_ANSWERS:
 				print("Отмена.")
 				return 1
 		os.makedirs(changes)
@@ -988,15 +1037,22 @@ def run(root, assume_yes=False):
 	now, stamp = next_moment(scans[-1] if scans else None)
 
 	progress = Progress(total=len(prev_flat) if prev_flat is not None else None)
-	flat, warnings = scan_fs(root, rules, progress)
+	printer = WarningPrinter(progress)
+	flat, warnings = scan_fs(root, rules, progress, printer)
 	progress.finish()
+	printer.finish()
+
+	if warnings and not warn_yes:
+		try:
+			answer = input(f"При сканировании были предупреждения ({len(warnings)}). Продолжить и сохранить результат? [y/N] ")
+		except EOFError:
+			answer = ""
+		if answer.strip().lower() not in YES_ANSWERS:
+			print("Отмена: ничего не сохранено.")
+			return 1
 
 	snapshot = make_snapshot(root, now, rules, flat)
 	write_text_atomic(os.path.join(changes, scan_name(stamp)), dumps_snapshot(snapshot))
-	for w in warnings[:10]:
-		print(f"Предупреждение: не прочитано {w}", file=sys.stderr)
-	if len(warnings) > 10:
-		print(f"... и ещё {len(warnings) - 10}", file=sys.stderr)
 
 	if prev is None:
 		print(f"первый скан сохранён: {len(flat)} объектов ({scan_name(stamp)})")
@@ -1025,9 +1081,13 @@ def main(argv=None):
 	parser = argparse.ArgumentParser(prog="chkan.py", description="Скан ФС и обратимый diff в ./.changes/")
 	parser.add_argument("dir", nargs="?", default=".", help="папка, в которой лежит .changes (по умолчанию текущая)")
 	parser.add_argument("-y", "--yes", action="store_true", help="не спрашивать подтверждение при создании .changes")
+	parser.add_argument(
+		"-w", "--warn-yes", action="store_true",
+		help="если при сканировании были предупреждения, не спрашивать, а продолжать",
+	)
 	args = parser.parse_args(argv)
 	try:
-		return run(os.path.abspath(args.dir), assume_yes=args.yes)
+		return run(os.path.abspath(args.dir), assume_yes=args.yes, warn_yes=args.warn_yes)
 	except ChkanError as e:
 		print(f"Ошибка: {e}", file=sys.stderr)
 		return 2
