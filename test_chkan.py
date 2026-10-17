@@ -47,7 +47,6 @@ def snap(flat, taken_at="2026-10-01T15:00:00+02:00", exclude=(), root="/r"):
 		"format": chkan.FORMAT,
 		"root": root,
 		"taken_at": taken_at,
-		"tz": "+02:00",
 		"exclude": list(exclude),
 		"tree": chkan.build_tree(flat),
 	}
@@ -58,6 +57,10 @@ def diff_between(old_flat, new_flat, rules_text="", old_ex=(), new_ex=()):
 	a = snap(old_flat, "2026-10-01T15:00:00+02:00", old_ex)
 	b = snap(new_flat, "2026-10-02T09:00:00+02:00", new_ex)
 	return a, b, chkan.build_diff(a, b, rules), rules
+
+
+def sizes(group):
+	return [chkan.parse_size(x) for x in group["size"]]
 
 
 def read_text(path):
@@ -356,13 +359,10 @@ class SnapshotTree(unittest.TestCase):
 		with self.assertRaises(chkan.ChkanError):
 			chkan.build_tree({".": drec(), "a": rec(), "a/b": rec()})
 
-	def test_tz_string(self):
-		f = lambda h, m=0: chkan.tz_string(datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone(datetime.timedelta(hours=h, minutes=m))))
-		self.assertEqual(f(3), "+03:00")
-		self.assertEqual(f(0), "+00:00")
-		self.assertEqual(f(-5), "-05:00")
-		self.assertEqual(f(5, 30), "+05:30")
-		self.assertEqual(f(-9, -30), "-09:30")
+	def test_no_tz_field_offset_lives_in_taken_at(self):
+		s = snap(base_flat(), "2026-10-01T15:00:00+02:00")
+		self.assertNotIn("tz", s)
+		self.assertTrue(s["taken_at"].endswith("+02:00"))
 
 
 # ------------------------------------------------------------ diff: вычисление
@@ -549,14 +549,16 @@ class DiffGrouping(unittest.TestCase):
 
 	def test_sizes_per_group(self):
 		g = self.diff()["groups"]
-		self.assertEqual(g["-"]["size"], [10 + 40, 50 + 40])
-		self.assertEqual(g["tag"]["size"], [100 + 100, 100 + 130])
-		self.assertEqual(g["photos+tag"]["size"], [0, 50])
-		self.assertEqual(g["logs"]["size"], [2000, 2600])
+		self.assertEqual(sizes(g["-"]), [10 + 40, 50 + 40])
+		self.assertEqual(sizes(g["tag"]), [100 + 100, 100 + 130])
+		self.assertEqual(sizes(g["photos+tag"]), [0, 50])
+		self.assertEqual(sizes(g["logs"]), [2000, 2600])
+		self.assertEqual(g["logs"]["size"], ["2_000=1.9K", "2_600=2.5K"])
+		self.assertEqual(g["photos+tag"]["size"], ["0=0B", "50=50B"])
 
 	def test_cancelled_tag_files_count_as_untagged(self):
 		# dir/B/b.txt (40 байт) не менялся, но no_tag делает его «без тегов» и он входит в сумму
-		self.assertEqual(self.diff()["groups"]["-"]["size"], [50, 90])
+		self.assertEqual(sizes(self.diff()["groups"]["-"]), [50, 90])
 
 	def test_move_goes_to_destination_group_with_path_compression(self):
 		g = self.diff()["groups"]["tag"]["ch"]
@@ -584,8 +586,8 @@ class DiffGrouping(unittest.TestCase):
 		old = {".": drec(ino=2), "dir": drec(ino=3), "dir/f": rec(ino=4, size=100)}
 		new = {".": drec(ino=2), "dir": drec(ino=3), "g": rec(ino=4, size=100)}
 		d = diff_between(old, new, "dir/\t# tag\n")[2]
-		self.assertEqual(d["groups"]["tag"], {"size": [100, 0]})
-		self.assertEqual(d["groups"]["-"]["size"], [0, 100])
+		self.assertEqual(d["groups"]["tag"], {"size": ["100=100B", "0=0B"]})
+		self.assertEqual(sizes(d["groups"]["-"]), [0, 100])
 		self.assertEqual(d["groups"]["-"]["ch"]["g"]["op"], "move")
 
 	def test_no_group_without_changes(self):
@@ -615,10 +617,11 @@ class DiffGrouping(unittest.TestCase):
 		self.assertEqual(d["from"]["exclude"], ["data"])
 		self.assertEqual(d["to"]["exclude"], ["tmp"])
 
-	def test_headers_have_tz(self):
+	def test_headers_have_no_tz(self):
 		d = self.diff()
-		self.assertEqual(d["from"]["tz"], "+02:00")
-		self.assertEqual(d["to"]["tz"], "+02:00")
+		self.assertEqual(list(d["from"]), ["taken_at", "exclude"])
+		self.assertEqual(list(d["to"]), ["taken_at", "exclude"])
+		self.assertTrue(d["from"]["taken_at"].endswith("+02:00"))
 
 	def test_count_objects(self):
 		self.assertEqual(chkan.count_objects(self.diff()), (1, 3))
@@ -679,9 +682,9 @@ class Reversibility(unittest.TestCase):
 		flat = {".": drec(ino=2), "a": rec(ino=3, size=1), "b": rec(ino=4, size=2)}
 		diff = {
 			"format": chkan.FORMAT,
-			"from": {"taken_at": "t0", "tz": "+00:00", "exclude": []},
-			"to": {"taken_at": "t1", "tz": "+00:00", "exclude": []},
-			"groups": {"-": {"size": [3, 3], "ch": {"a": {"op": "move", "from": "b"}, "b": {"op": "move", "from": "a"}}}},
+			"from": {"taken_at": "t0", "exclude": []},
+			"to": {"taken_at": "t1", "exclude": []},
+			"groups": {"-": {"size": ["3=3B", "3=3B"], "ch": {"a": {"op": "move", "from": "b"}, "b": {"op": "move", "from": "a"}}}},
 		}
 		s = snap(flat, "t0")
 		out = chkan.apply_diff(s, diff)
@@ -773,7 +776,7 @@ class Formatting(unittest.TestCase):
 
 	def test_snapshot_header(self):
 		s = snap(base_flat())
-		self.assertEqual(list(s), ["format", "root", "taken_at", "tz", "exclude", "tree"])
+		self.assertEqual(list(s), ["format", "root", "taken_at", "exclude", "tree"])
 		self.assertIn("ch", s["tree"])
 		self.assertNotIn('"c"', chkan.dumps_snapshot(s))
 
@@ -790,6 +793,70 @@ class Formatting(unittest.TestCase):
 			p = os.path.join(t, "x.json")
 			chkan.write_text_atomic(p, "{}")
 			self.assertEqual(os.listdir(t), ["x.json"])
+
+
+class SizeFormat(unittest.TestCase):
+	def test_examples(self):
+		cases = {
+			0: "0=0B",
+			5: "5=5B",
+			500: "500=500B",
+			1023: "1_023=1023B",
+			1024: "1_024=1.0K",
+			1536: "1_536=1.5K",
+			10 * 1024: "10_240=10K",
+			1_023_002_146: "1_023_002_146=975M",
+			8_234_782_596: "8_234_782_596=7.6G",
+			1024**4: "1_099_511_627_776=1.0T",
+			1024**7: "1_180_591_620_717_411_303_424=1024E",
+		}
+		for n, expected in cases.items():
+			with self.subTest(n):
+				self.assertEqual(chkan.format_size(n), expected)
+
+	def test_rounds_down_not_up(self):
+		self.assertEqual(chkan.format_size(1024 * 1024 - 1), "1_048_575=1023K")
+		self.assertEqual(chkan.format_size(10 * 1024 - 1), "10_239=9.9K")
+
+	def test_digits_are_two_or_three_between_units(self):
+		for n in (12_345, 999_999, 5 * 1024**2 + 123, 77 * 1024**3, 400 * 1024**3 + 5):
+			human = chkan.format_size(n).split("=")[1]
+			digits = len(re.sub(r"\D", "", human))
+			self.assertIn(digits, (2, 3), human)
+
+	def test_parse_roundtrip(self):
+		for n in (0, 1, 999, 1024, 1_023_002_146, 8_234_782_596, 2**50 + 7):
+			self.assertEqual(chkan.parse_size(chkan.format_size(n)), n)
+
+	def test_parse_accepts_plain_numbers(self):
+		self.assertEqual(chkan.parse_size(1234), 1234)
+		self.assertEqual(chkan.parse_size("1234"), 1234)
+		self.assertEqual(chkan.parse_size("1_234"), 1234)
+
+	def test_record_sizes_stay_numbers(self):
+		d = DiffGrouping().diff()
+		node = d["groups"]["tag"]["ch"]["dir"]["ch"]["F.txt"]
+		self.assertEqual(node["set"]["size"], [100, 130])
+		add = d["groups"]["photos+tag"]["ch"]["media/new.jpg"]
+		self.assertEqual(add["new"]["size"], 50)
+
+
+class OldFilesStillRead(unittest.TestCase):
+	def test_old_files_with_tz_and_numeric_sizes_still_apply(self):
+		a, b, d, _ = diff_between(DiffGrouping().flat_old(), DiffGrouping().flat_new(), TAGS_FOR_DIFF)
+		d = roundtrip(d)
+		a_old = json.loads(json.dumps(a))
+		b_old = json.loads(json.dumps(b))
+		for obj in (a_old, b_old):
+			obj["tz"] = "+02:00"
+		for key in ("from", "to"):
+			d[key]["tz"] = "+02:00"
+		for g in d["groups"].values():
+			if isinstance(g, dict):
+				g["size"] = [chkan.parse_size(x) for x in g["size"]]
+		back = chkan.apply_diff(b_old, d, backward=True)
+		self.assertTrue(chkan.snapshots_equal(back, a_old))
+		self.assertTrue(chkan.snapshots_equal(chkan.apply_diff(a_old, d), b_old))
 
 
 class ProgressBar(unittest.TestCase):
@@ -1215,16 +1282,17 @@ class EndToEnd(unittest.TestCase):
 		self.assertIn("раньше", err)
 		self.assertEqual(len(self.scans()), 1)
 
-	def test_headers_have_numeric_tz(self):
+	def test_headers_have_no_tz_but_offset_in_taken_at(self):
 		self.write("a", b"1")
 		self.step()
 		self.write("b", b"1")
 		self.step()
 		scan = chkan.read_json(os.path.join(self.changes, self.scans()[-1]))
 		d = chkan.read_json(os.path.join(self.changes, self.diffs()[0]))
-		self.assertEqual(scan["tz"], "+02:00")
-		self.assertEqual(d["from"]["tz"], "+02:00")
-		self.assertEqual(d["to"]["tz"], "+02:00")
+		self.assertNotIn("tz", scan)
+		self.assertNotIn("tz", d["from"])
+		self.assertNotIn("tz", d["to"])
+		self.assertEqual(d["from"]["taken_at"], "2026-10-01T15:01:00+02:00")
 		self.assertEqual(d["to"]["taken_at"], "2026-10-01T15:02:00+02:00")
 
 	def test_changes_dir_is_not_in_snapshot(self):

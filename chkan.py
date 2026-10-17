@@ -565,7 +565,6 @@ def build_tree(flat):
 def make_head(root, now, rules):
 	return {
 		"taken_at": now.isoformat(),
-		"tz": tz_string(now),
 		"exclude": list(rules.exclude),
 	}
 
@@ -576,26 +575,45 @@ def make_snapshot(root, now, rules, flat):
 		"format": FORMAT,
 		"root": root,
 		"taken_at": head["taken_at"],
-		"tz": head["tz"],
 		"exclude": head["exclude"],
 		"tree": build_tree(flat),
 	}
 
 
 def snapshot_head(snap):
-	return {"taken_at": snap["taken_at"], "tz": snap["tz"], "exclude": list(snap["exclude"])}
+	return {"taken_at": snap["taken_at"], "exclude": list(snap["exclude"])}
 
 
 def snapshots_equal(a, b):
 	return snapshot_head(a) == snapshot_head(b) and a["root"] == b["root"] and flatten(a["tree"]) == flatten(b["tree"])
 
 
-def tz_string(dt):
-	off = dt.utcoffset() or datetime.timedelta(0)
-	total = int(off.total_seconds())
-	sign = "-" if total < 0 else "+"
-	minutes = abs(total) // 60
-	return f"{sign}{minutes // 60:02d}:{minutes % 60:02d}"
+# ---------------------------------------------------------------- размеры
+
+
+SIZE_UNITS = "BKMGTPE"
+
+
+def format_size(n):
+	"""1023002146 -> '1_023_002_146=975M': байты с разрядами через _ и размер
+	(кратность 1024, отбрасывание лишнего) с 2-3 цифрами и буквой порядка."""
+	unit = 0
+	while n >= 1024 ** (unit + 1) and unit < len(SIZE_UNITS) - 1:
+		unit += 1
+	div = 1024**unit
+	if unit and n < 10 * div:
+		tenths = n * 10 // div
+		human = f"{tenths // 10}.{tenths % 10}"
+	else:
+		human = str(n // div)
+	return f"{n:_}={human}{SIZE_UNITS[unit]}"
+
+
+def parse_size(value):
+	"""Обратно: '1_023_002_146=975M' -> 1023002146 (число тоже принимается)."""
+	if isinstance(value, int):
+		return value
+	return int(value.split("=", 1)[0].replace("_", ""))
 
 
 # ---------------------------------------------------------------- diff: вычисление
@@ -737,7 +755,7 @@ def build_diff_flat(old_head, old_flat, new_head, new_flat, rules, root):
 	keys = set(groups) | {t for t, (a, b) in sizes.items() if a != b}
 	entries = []
 	for tags in keys:
-		group = {"size": list(sizes.get(tags, [0, 0]))}
+		group = {"size": [format_size(n) for n in sizes.get(tags, [0, 0])]}
 		if tags in groups:
 			group["ch"] = build_ch(groups[tags])
 		label = "+".join(sorted(tags)) if tags else NO_TAGS_KEY
@@ -913,7 +931,6 @@ def apply_diff(snapshot, diff, backward=False, strict=True):
 		"format": FORMAT,
 		"root": snapshot["root"],
 		"taken_at": dst_head["taken_at"],
-		"tz": dst_head["tz"],
 		"exclude": list(dst_head["exclude"]),
 		"tree": build_tree(flat),
 	}
