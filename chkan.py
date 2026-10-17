@@ -16,6 +16,7 @@ import argparse
 import ctypes
 import datetime
 import errno
+import glob
 import json
 import os
 import re
@@ -28,7 +29,10 @@ from collections import namedtuple
 CHANGES_DIR = ".changes"
 TAGS_FILE = "TAGS.txt"
 YES_ANSWERS = ("y", "yes", "д", "да")
-FORMAT = 3
+FORMAT = 4
+LOG_FILE = "chkan-log.txt"
+BACKUP_DIR = "format3"  # сюда уходят оригиналы при переходе с формата 3
+TIME_FIELDS = ("mtime", "ctime", "btime")
 ROOT_KEY = "."
 NO_TAGS_KEY = "-"
 SEPARATOR_KEY = "-" * 10
@@ -47,6 +51,8 @@ COMMENT_RE = re.compile(r"(^|\s)//")  # комментарий: // в начал
 RUN_START = "@run("
 RUN_NEXT_RE = re.compile(r"\)[ \t]*@run\(")
 SCAN_RE = re.compile(r"^scan_(\d{8}-\d{6})\.json$")
+DIFF_RE = re.compile(r"^diff_(\d{8}-\d{6})_(\d{8}-\d{6})\.json$")
+TIME_RE = re.compile(r"^(?:(?:(?:(\d{4})-)?(\d{2})-)?(\d{2}) )?(\d{2}):(\d{2}):(\d{2})$")
 
 TAGS_TEMPLATE = """\
 // root = папка, в которой лежит .changes/
@@ -58,11 +64,30 @@ TAGS_TEMPLATE = """\
 //               в окружении CHKAN_TAGS, CHKAN_DIFF, CHKAN_SCAN. @run пишите последним в строке.
 // Пример:
 //   .cache/	# @exclude
+//   .changes/	# @exclude  (по умолчанию .changes сканируется как обычная папка)
+//   projects/*/src	# work  (wildcard-ы: * ? [...] {a,b}; посмотреть во что раскрылись: chkan.py wildcard)
 //   projects/	# work
 //   	old/	# @no(work)
 //   # noisy(ignore)	// строка без пути только помечает тег игнорируемым
 //   # @run(echo $CHKAN_DIFF)
 """
+
+
+_progress_disabled = False  # --no-progress
+
+
+def msg(text="", end="\n"):
+	"""Сообщение пользователю: всегда в stderr (в stdout только статистика)."""
+	print(text, end=end, file=sys.stderr, flush=True)
+
+
+def ask(prompt):
+	"""Вопрос в stderr; пустой ответ и конец ввода считаются «нет»."""
+	msg(prompt, end="")
+	try:
+		return input().strip().lower() in YES_ANSWERS
+	except EOFError:
+		return False
 
 
 class ChkanError(Exception):
@@ -160,11 +185,12 @@ class Resolver:
 
 
 class Rules:
-	def __init__(self, trie, ignore_tags, exclude, runs=()):
+	def __init__(self, trie, ignore_tags, exclude, runs=(), wildcards=()):
 		self.trie = trie
 		self.ignore_tags = frozenset(ignore_tags)
 		self.exclude = list(exclude)
 		self.runs = list(runs)  # [(путь относительно root или '.', команда)] в порядке файла
+		self.wildcards = list(wildcards)  # [(номер строки, полный путь с wildcard-ом, [во что раскрылся])]
 
 	def root_state(self):
 		tags, excluded = _apply_ops(self.trie, frozenset(), False)
@@ -246,12 +272,53 @@ def parse_tag_items(text, where):
 	return items
 
 
-def parse_tags(text):
+BRACE_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def expand_braces(text):
+	"""a/{x,y}/f -> a/x/f, a/y/f (модуль glob фигурные скобки не знает)."""
+	m = BRACE_RE.search(text)
+	if not m:
+		return [text]
+	out = []
+	for alt in m.group(1).split(","):
+		out.extend(expand_braces(text[: m.start()] + alt + text[m.end():]))
+	return list(dict.fromkeys(out))  # вложенные скобки раскрываются изнутри и дают повторы
+
+
+def is_wildcard(path):
+	return glob.has_magic(path) or bool(BRACE_RE.search(path))
+
+
+def expand_path(path_text, parents, root, where):
+	"""Путь из строки TAGS.txt -> список полных путей (кортежей имён) под каждым из родителей."""
+	variants = expand_braces(path_text)
+	result, seen = [], set()
+	for parent in parents:
+		for variant in variants:
+			segs = [seg for seg in variant.split("/") if seg not in ("", ".")]
+			if ".." in segs:
+				raise ChkanError(f"{where}: .. в путях запрещено")
+			if glob.has_magic("/".join(segs)):
+				pattern = "/".join([glob.escape(name) for name in parent] + segs)
+				found = [tuple(m.split("/")) for m in sorted(glob.glob(pattern, root_dir=root))]
+			else:
+				found = [parent + tuple(segs)]
+			for path in found:
+				if path not in seen:
+					seen.add(path)
+					result.append(path)
+	return result
+
+
+def parse_tags(text, root=".", strict=True):
+	"""strict=False: wildcard без совпадений не ошибка (нужно команде wildcard, чтобы это показать)."""
 	trie = TagNode()
 	ignore_tags = set()
 	exclude = []
 	runs = []
-	stack = []
+	wildcards = []
+	stack = []  # на каждый уровень вложенности: (полный путь как написан, [раскрытые пути])
 	for lineno, raw in enumerate(text.splitlines(), 1):
 		cm = COMMENT_RE.search(raw)
 		line = (raw[: cm.start()] if cm else raw).rstrip()
@@ -276,27 +343,32 @@ def parse_tags(text):
 			continue
 		if path_part.startswith("/"):
 			raise ChkanError(f"{where}: пути задаются относительно root, без начального /")
-		segs = [seg for seg in path_part.split("/") if seg not in ("", ".")]
-		if ".." in segs:
-			raise ChkanError(f"{where}: .. в путях запрещено")
 		if indent > len(stack):
 			raise ChkanError(f"{where}: слишком глубокий отступ")
 		del stack[indent:]
-		full = (stack[-1] if stack else ()) + tuple(segs)
-		stack.append(full)
-		node = trie
-		for seg in full:
-			node = node.children.setdefault(seg, TagNode())
-		for kind, value, _ignore in parsed:
-			if kind in ("add", "cancel", "exclude"):
-				node.ops.append((kind, value))
-			if kind == "exclude":
-				if not full:
-					raise ChkanError(f"{where}: нельзя исключить root")
-				exclude.append("/".join(full))
-			elif kind == "run":
-				runs.append(("/".join(full) or ROOT_KEY, value))
-	return Rules(trie, ignore_tags, canonical_exclude(exclude), runs)
+		parent_text, parents = stack[-1] if stack else ("", [()])
+		own_text = "/".join(seg for seg in path_part.split("/") if seg not in ("", "."))
+		full_text = "/".join(x for x in (parent_text, own_text) if x)
+		paths = expand_path(path_part, parents, root, where)
+		if not paths and strict and parents:
+			raise ChkanError(f"{where}: по шаблону {full_text!r} ничего не найдено")
+		stack.append((full_text, paths))
+		if is_wildcard(full_text):
+			wildcards.append((lineno, full_text, ["/".join(p) for p in paths]))
+		for path in paths:
+			node = trie
+			for seg in path:
+				node = node.children.setdefault(seg, TagNode())
+			for kind, value, _ignore in parsed:
+				if kind in ("add", "cancel", "exclude"):
+					node.ops.append((kind, value))
+				if kind == "exclude":
+					if not path:
+						raise ChkanError(f"{where}: нельзя исключить root")
+					exclude.append("/".join(path))
+				elif kind == "run":
+					runs.append(("/".join(path) or ROOT_KEY, value))
+	return Rules(trie, ignore_tags, canonical_exclude(exclude), runs, wildcards)
 
 
 # ---------------------------------------------------------------- stat
@@ -392,14 +464,14 @@ def _statx_record(path):
 		raise OSError(err, os.strerror(err), path)
 	btime = None
 	if buf.stx_mask & STATX_BTIME:
-		btime = buf.stx_btime.tv_sec * 10**9 + buf.stx_btime.tv_nsec
+		btime = buf.stx_btime.tv_sec
 	return _make_record(
 		buf.stx_mode,
 		os.makedev(buf.stx_dev_major, buf.stx_dev_minor),
 		buf.stx_ino,
 		buf.stx_size,
-		buf.stx_mtime.tv_sec * 10**9 + buf.stx_mtime.tv_nsec,
-		buf.stx_ctime.tv_sec * 10**9 + buf.stx_ctime.tv_nsec,
+		buf.stx_mtime.tv_sec,
+		buf.stx_ctime.tv_sec,
 		btime,
 		buf.stx_uid,
 		buf.stx_gid,
@@ -409,7 +481,7 @@ def _statx_record(path):
 
 def _lstat_record(path):
 	st = os.lstat(path)
-	return _make_record(st.st_mode, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, None, st.st_uid, st.st_gid, path)
+	return _make_record(st.st_mode, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns // 10**9, st.st_ctime_ns // 10**9, None, st.st_uid, st.st_gid, path)
 
 
 def stat_record(path):
@@ -464,7 +536,7 @@ class Progress:
 		self.label = label
 		self.total = total
 		self.stream = stream if stream is not None else sys.stderr
-		self.enabled = self.stream.isatty() if enabled is None else enabled
+		self.enabled = (not _progress_disabled and self.stream.isatty()) if enabled is None else enabled
 		self.width = width
 		self.interval = interval
 		self.clock = clock
@@ -614,8 +686,6 @@ def scan_fs(root, rules, progress=None, on_warning=None):
 			warn(f"{rel_dir}: {e.strerror}")
 			continue
 		for name in names:
-			if rel_dir == ROOT_KEY and name == CHANGES_DIR:
-				continue
 			cstate = rules.child_state(state, name)
 			if cstate.excluded:
 				continue
@@ -755,66 +825,132 @@ def parse_size(value):
 	return int(value.split("=", 1)[0].replace("_", ""))
 
 
-def format_delta(n):
-	"""+25_573_854=+24M / -1_024=-1.0K / 0=0B"""
-	text = format_size(abs(n))
-	if n == 0:
-		return text
-	sign = "+" if n > 0 else "-"
-	num, human = text.split("=")
-	return f"{sign}{num}={sign}{human}"
+def format_delta_short(n):
+	"""+97G / -1.0K / 0B: только знак и размер для людей."""
+	human = format_size(abs(n)).split("=", 1)[1]
+	return ("+" if n > 0 else "-" if n < 0 else "") + human
 
 
 def format_total_pair(pair):
-	"""[было, стало] -> [было, стало, на_сколько_изменилось] строками; None (поля не было) остаётся null."""
+	"""[было, стало] -> [было, стало, +на_сколько] строками; None (поля не было) остаётся null."""
 	a, b = pair
 	fa = None if a is None else format_size(a)
 	fb = None if b is None else format_size(b)
 	if a is None or b is None:
 		return [fa, fb]
-	return [fa, fb, format_delta(b - a)]
+	return [fa, fb, format_delta_short(b - a)]
 
 
-def parse_total_pair(pair):
+def parse_total_pair(pair, check_delta=True):
+	"""Строки обратно в [было, стало] целыми; третий элемент только для чтения человеком, но сверяется."""
 	try:
 		if len(pair) not in (2, 3):
 			raise ValueError("ожидалось 2 или 3 значения")
 		a, b = (None if x is None else parse_size(x) for x in pair[:2])
-		if len(pair) == 3 and a is not None and b is not None and parse_size(pair[2]) != b - a:
-			raise ValueError("разница не равна стало минус было")
+		if check_delta and len(pair) == 3 and a is not None and b is not None and pair[2] != format_delta_short(b - a):
+			raise ValueError(f"третье значение должно быть {format_delta_short(b - a)}")
 	except (ValueError, TypeError, AttributeError) as e:
 		raise DiffError(f"плохой суммарный размер {pair!r}: {e}")
 	return [a, b]
 
 
-def _format_record(rec):
+class TimeRef:
+	"""Опорные дата и часовой пояс из to.taken_at. В diff время пишется текстом в этом поясе,
+	а год, месяц и день, совпадающие с опорными, опускаются: 00:02:04 / 15 00:02:04 / 09-16 00:02:04 / 2024-09-16 00:02:04."""
+
+	def __init__(self, taken_at):
+		self.taken_at = taken_at
+		self._tz = self._date = None
+
+	def _load(self):
+		if self._date is None:
+			try:
+				dt = datetime.datetime.fromisoformat(self.taken_at)
+			except (TypeError, ValueError):
+				raise DiffError(f"плохое to.taken_at {self.taken_at!r}")
+			if dt.tzinfo is None:
+				dt = dt.replace(tzinfo=datetime.timezone.utc)
+			self._tz, self._date = dt.tzinfo, dt.date()
+
+	def encode(self, value):
+		if isinstance(value, bool) or not isinstance(value, int):
+			return value
+		self._load()
+		try:
+			dt = datetime.datetime.fromtimestamp(value, self._tz)
+		except (OverflowError, OSError, ValueError):
+			return value  # время вне диапазона дат остаётся числом секунд
+		clock = f"{dt:%H:%M:%S}"
+		ref = self._date
+		if dt.date() == ref:
+			return clock
+		if (dt.year, dt.month) == (ref.year, ref.month):
+			return f"{dt.day:02d} {clock}"
+		if dt.year == ref.year:
+			return f"{dt.month:02d}-{dt.day:02d} {clock}"
+		return f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d} {clock}"
+
+	def decode(self, value):
+		if not isinstance(value, str):
+			return value
+		m = TIME_RE.match(value)
+		if not m:
+			raise DiffError(f"плохое время {value!r}")
+		self._load()
+		year, month, day, hour, minute, sec = m.groups()
+		try:
+			dt = datetime.datetime(
+				int(year) if year else self._date.year,
+				int(month) if month else self._date.month,
+				int(day) if day else self._date.day,
+				int(hour), int(minute), int(sec),
+				tzinfo=self._tz,
+			)
+		except ValueError:
+			raise DiffError(f"плохое время {value!r}")
+		return int(dt.timestamp())
+
+
+def _format_record(rec, ref):
+	rec = dict(rec)
 	if isinstance(rec.get("total"), int):
-		rec = dict(rec)
 		rec["total"] = format_size(rec["total"])
+	for k in TIME_FIELDS:
+		if k in rec:
+			rec[k] = ref.encode(rec[k])
 	return rec
 
 
-def _parse_record(rec):
+def _parse_record(rec, ref):
+	rec = dict(rec)
 	if isinstance(rec.get("total"), str):
-		rec = dict(rec)
 		try:
 			rec["total"] = parse_size(rec["total"])
 		except ValueError as e:
 			raise DiffError(f"плохой суммарный размер {rec['total']!r}: {e}")
+	for k in TIME_FIELDS:
+		if k in rec:
+			rec[k] = ref.decode(rec[k])
 	return rec
 
 
-def _format_set(changes):
+def _format_set(changes, ref):
+	changes = dict(changes)
 	if "total" in changes:
-		changes = dict(changes)
 		changes["total"] = format_total_pair(changes["total"])
+	for k in TIME_FIELDS:
+		if k in changes:
+			changes[k] = [ref.encode(x) for x in changes[k]]
 	return changes
 
 
-def _parse_set(changes):
+def _parse_set(changes, ref):
+	changes = dict(changes)
 	if "total" in changes:
-		changes = dict(changes)
 		changes["total"] = parse_total_pair(changes["total"])
+	for k in TIME_FIELDS:
+		if k in changes:
+			changes[k] = [ref.decode(x) for x in changes[k]]
 	return changes
 
 
@@ -912,19 +1048,6 @@ def make_ops(old_flat, new_flat, old_under, new_under, stage=None):
 	return ops
 
 
-def op_to_node(op):
-	"""Операция -> узел для diff-файла; суммарные размеры папок пишутся строками."""
-	node = {"op": op["op"]}
-	for k in ("new", "old"):
-		if k in op:
-			node[k] = _format_record(op[k])
-	if "from" in op:
-		node["from"] = op["from"]
-	if "set" in op:
-		node["set"] = _format_set(op["set"])
-	return node
-
-
 def build_ch(nodes):
 	"""{путь: узел} -> дерево 'ch' со схлопыванием цепочек контейнеров с одним потомком."""
 	trie = {}
@@ -952,8 +1075,22 @@ def build_ch(nodes):
 	return emit(trie)
 
 
-def build_diff_flat(old_head, old_flat, new_head, new_flat, rules, root, stage=None):
+def op_to_node(op, ref):
+	"""Операция -> узел для diff-файла: суммарные размеры строками, время текстом."""
+	node = {"op": op["op"]}
+	for k in ("new", "old"):
+		if k in op:
+			node[k] = _format_record(op[k], ref)
+	if "from" in op:
+		node["from"] = op["from"]
+	if "set" in op:
+		node["set"] = _format_set(op["set"], ref)
+	return node
+
+
+def build_diff_flat(old_head, old_flat, new_head, new_flat, rules, root, stage=None, comment=None):
 	stage = stage or null_stage
+	ref = TimeRef(new_head["taken_at"])
 	old_under = make_excluder(old_head["exclude"])
 	new_under = make_excluder(new_head["exclude"])
 	ops = make_ops(old_flat, new_flat, old_under, new_under, stage)
@@ -964,7 +1101,7 @@ def build_diff_flat(old_head, old_flat, new_head, new_flat, rules, root, stage=N
 	with stage("diff: группы и размеры", total=len(ops) + len(old_flat) + len(new_flat)) as progress:
 		done = 0
 		for op in ops:
-			node = op_to_node(op)
+			node = op_to_node(op, ref)
 			if op["op"] in ("add_scan", "remove_scan"):
 				scan_nodes[op["path"]] = node
 			else:
@@ -985,7 +1122,7 @@ def build_diff_flat(old_head, old_flat, new_head, new_flat, rules, root, stage=N
 	keys = set(groups) | {t for t, (a, b) in sizes.items() if a != b}
 	entries = []
 	for tags in keys:
-		group = {"size": [format_size(n) for n in sizes.get(tags, [0, 0])]}
+		group = {"size": format_total_pair(sizes.get(tags, [0, 0]))}
 		if tags in groups:
 			group["ch"] = build_ch(groups[tags])
 		label = "+".join(sorted(tags)) if tags else NO_TAGS_KEY
@@ -1006,14 +1143,16 @@ def build_diff_flat(old_head, old_flat, new_head, new_flat, rules, root, stage=N
 		"root": root,
 		"from": dict(old_head),
 		"to": dict(new_head),
-		"groups": out_groups,
 	}
+	if comment:
+		diff["c"] = comment
+	diff["groups"] = out_groups
 	if scan_nodes:
 		diff["scan"] = {"ch": build_ch(scan_nodes)}
 	return diff
 
 
-def build_diff(old_snap, new_snap, rules):
+def build_diff(old_snap, new_snap, rules, comment=None):
 	return build_diff_flat(
 		snapshot_head(old_snap),
 		flatten(old_snap["tree"]),
@@ -1021,6 +1160,7 @@ def build_diff(old_snap, new_snap, rules):
 		flatten(new_snap["tree"]),
 		rules,
 		new_snap["root"],
+		comment=comment,
 	)
 
 
@@ -1038,25 +1178,26 @@ def iter_nodes(ch, prefix=""):
 			yield from iter_nodes(node["ch"], path)
 
 
-def node_to_op(path, node):
+def node_to_op(path, node, ref):
 	op = {"op": node["op"], "path": path}
 	for k in ("new", "old"):
 		if k in node:
-			op[k] = _parse_record(node[k])
+			op[k] = _parse_record(node[k], ref)
 	if "from" in node:
 		op["from"] = node["from"]
 	if "set" in node:
-		op["set"] = _parse_set(node["set"])
+		op["set"] = _parse_set(node["set"], ref)
 	return op
 
 
 def diff_ops(diff):
+	ref = TimeRef(diff.get("to", {}).get("taken_at"))
 	ops = []
 	for key, group in diff.get("groups", {}).items():
 		if key == SEPARATOR_KEY or not isinstance(group, dict):
 			continue
-		ops.extend(node_to_op(p, n) for p, n in iter_nodes(group.get("ch", {})))
-	ops.extend(node_to_op(p, n) for p, n in iter_nodes(diff.get("scan", {}).get("ch", {})))
+		ops.extend(node_to_op(p, n, ref) for p, n in iter_nodes(group.get("ch", {})))
+	ops.extend(node_to_op(p, n, ref) for p, n in iter_nodes(diff.get("scan", {}).get("ch", {})))
 	return ops
 
 
@@ -1073,9 +1214,11 @@ def _count_group(group, counts):
 
 
 def count_ops(diff):
-	"""[(метка, счётчики)]: без тегов, каждая отслеживаемая комбинация, не отслеживаемые комбинации."""
+	"""[(метка, счётчики, size)]: без тегов, каждая отслеживаемая комбинация, не отслеживаемые комбинации.
+	size: [было, стало, ...] из diff или None."""
 	untagged = dict.fromkeys(COUNT_KEYS, 0)
 	ignored = dict.fromkeys(COUNT_KEYS, 0)
+	untagged_size = None
 	rows = []
 	after_separator = False
 	for key, group in diff.get("groups", {}).items():
@@ -1088,18 +1231,28 @@ def count_ops(diff):
 			_count_group(group, ignored)
 		elif key == NO_TAGS_KEY:
 			_count_group(group, untagged)
+			untagged_size = group.get("size")
 		else:
 			counts = dict.fromkeys(COUNT_KEYS, 0)
 			_count_group(group, counts)
-			rows.append((key, counts))
-	return [("без тегов", untagged)] + rows + [("с не отслеживаемыми тэгами", ignored)]
+			rows.append((key, counts, group.get("size")))
+	return [("без тегов", untagged, untagged_size)] + rows + [("с не отслеживаемыми тэгами", ignored, None)]
+
+
+def _size_suffix(size):
+	""" sf:283K st:16M s+16M (было, стало, на сколько изменился)."""
+	if not size or len(size) < 2:
+		return ""
+	a, b = parse_size(size[0]), parse_size(size[1])
+	human = lambda n: format_size(n).split("=", 1)[1]
+	return f" sf:{human(a)} st:{human(b)} s{format_delta_short(b - a)}"
 
 
 def format_summary(diff):
-	"""+созданные -удалённые ~изменённые(не папки) ->перемещённые d~изменённые папки"""
+	"""+созданные -удалённые ~изменённые(не папки) ->перемещённые d~изменённые папки [sf:было st:стало s±разница]"""
 	return [
-		f"{label}: +{c['add']} -{c['remove']} ~{c['change']} ->{c['move']} d~{c['change_d']}"
-		for label, c in count_ops(diff)
+		f"{label}: +{c['add']} -{c['remove']} ~{c['change']} ->{c['move']} d~{c['change_d']}{_size_suffix(size)}"
+		for label, c, size in count_ops(diff)
 	]
 
 
@@ -1253,6 +1406,50 @@ def dumps_pretty(value, level=0):
 	return _compact(value)
 
 
+def _tabs(n):
+	return "\t" * n
+
+
+def _expanded(node, level):
+	items = []
+	for k, v in node.items():
+		text = _ch_text(v, level + 1) if k == "ch" else _compact(v)
+		items.append(f"{_tabs(level + 1)}{json.dumps(k, ensure_ascii=False)}: {text}")
+	return "{\n" + ",\n".join(items) + "\n" + _tabs(level) + "}"
+
+
+def _ch_text(ch, level):
+	"""Каждый элемент ch на своей строке; level: уровень самого словаря ch."""
+	items = [f"{_tabs(level + 1)}{json.dumps(k, ensure_ascii=False)}: {_node_text(v, level + 1)}" for k, v in ch.items()]
+	return "{\n" + ",\n".join(items) + "\n" + _tabs(level) + "}"
+
+
+def _node_text(node, level):
+	"""Узел из одних op и set (изменение) и короткие листья в одну строку; set всегда в одну строку."""
+	if not isinstance(node, dict):
+		return _compact(node)
+	if "ch" not in node and (set(node) == {"op", "set"} or len(_compact(node)) <= INLINE_LIMIT):
+		return _compact(node)
+	return _expanded(node, level)
+
+
+def dumps_diff(diff):
+	"""Файл diff: format, root, from, to, c, groups, scan. Правится руками (комментарии `c`)."""
+	items = []
+	for k, v in diff.items():
+		if k == "groups":
+			inner = [f"{_tabs(2)}{json.dumps(gk, ensure_ascii=False)}: {_node_text(gv, 2)}" for gk, gv in v.items()]
+			text = "{\n" + ",\n".join(inner) + "\n\t}"
+		elif k == "scan":
+			text = _node_text(v, 1)
+		elif isinstance(v, dict):
+			text = dumps_pretty(v, 1)
+		else:
+			text = _compact(v)
+		items.append(f"\t{json.dumps(k, ensure_ascii=False)}: {text}")
+	return "{\n" + ",\n".join(items) + "\n}"
+
+
 def dumps_snapshot(snapshot):
 	return json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
 
@@ -1268,7 +1465,8 @@ def read_json(path):
 	with open(path, encoding="utf-8", errors="surrogateescape") as f:
 		data = json.load(f)
 	if data.get("format") != FORMAT:
-		raise ChkanError(f"{path}: формат {data.get('format')!r}, ожидался {FORMAT}")
+		hint = "; запустите chkan.py без аргументов, он предложит преобразовать" if data.get("format") == 3 else ""
+		raise ChkanError(f"{path}: формат {data.get('format')!r}, ожидался {FORMAT}{hint}")
 	return data
 
 
@@ -1279,21 +1477,20 @@ def run_hooks(root, runs, env_extra):
 	"""Выполняет команды @run по очереди, каждую в bash -c; возвращает число неудач."""
 	failures = 0
 	for rel, command in runs:
-		print(f"{rel} # @run({command})")
-		sys.stdout.flush()
+		msg(f"{rel} # @run({command})")
 		cwd = root if rel == ROOT_KEY else os.path.join(root, *rel.split("/"))
 		if not os.path.isdir(cwd):
-			print(f"Ошибка: нет папки {rel}, команда пропущена", file=sys.stderr)
+			msg(f"Ошибка: нет папки {rel}, команда пропущена")
 			failures += 1
 			continue
 		try:
 			code = subprocess.run(["bash", "-c", command], cwd=cwd, env={**os.environ, **env_extra}).returncode
 		except OSError as e:
-			print(f"Ошибка: не удалось запустить bash: {e}", file=sys.stderr)
+			msg(f"Ошибка: не удалось запустить bash: {e}")
 			failures += 1
 			continue
 		if code != 0:
-			print(f"Команда завершилась с кодом {code}", file=sys.stderr)
+			msg(f"Команда завершилась с кодом {code}")
 			failures += 1
 	return failures
 
@@ -1337,29 +1534,237 @@ def next_moment(last_stamp):
 		time.sleep(0.2)
 
 
+# ---------------------------------------------------------------- переход с формата 3
+
+
+def peek_format(path):
+	with open(path, "rb") as f:
+		head = f.read(300)
+	m = re.search(rb'"format"\s*:\s*(\d+)', head)
+	return int(m.group(1)) if m else None
+
+
+def old_format_files(changes):
+	"""[(имя, формат)] для scan_*/diff_*, которые не в текущем формате."""
+	out = []
+	for name in sorted(os.listdir(changes)):
+		if SCAN_RE.match(name) or DIFF_RE.match(name):
+			fmt = peek_format(os.path.join(changes, name))
+			if fmt != FORMAT:
+				out.append((name, fmt))
+	return out
+
+
+def _sec(value):
+	return value // 10**9 if isinstance(value, int) and not isinstance(value, bool) else value
+
+
+def migrate_snapshot(data):
+	"""Формат 3 -> 4: время в секундах, без tz."""
+	data["format"] = FORMAT
+	data.pop("tz", None)
+	stack = [data["tree"]]
+	while stack:
+		node = stack.pop()
+		for k in TIME_FIELDS:
+			if k in node:
+				node[k] = _sec(node[k])
+		stack.extend(node.get("ch", {}).values())
+	return data
+
+
+def _migrate_node(node, ref):
+	"""False, если изменение состояло только из долей секунды и исчезло."""
+	for k in ("new", "old"):
+		if k in node:
+			rec = dict(node[k])
+			for f in TIME_FIELDS:
+				if f in rec:
+					rec[f] = ref.encode(_sec(rec[f]))
+			node[k] = rec
+	changes = node.get("set")
+	if changes is not None:
+		for f in TIME_FIELDS:
+			if f in changes:
+				a, b = (_sec(x) for x in changes[f])
+				if a == b:
+					del changes[f]
+				else:
+					changes[f] = [ref.encode(a), ref.encode(b)]
+		if "total" in changes:
+			changes["total"] = format_total_pair(parse_total_pair(changes["total"], check_delta=False))
+		if not changes:
+			if node["op"] in CHANGE_OPS:
+				return False
+			del node["set"]
+	return True
+
+
+def _migrate_ch(ch, ref):
+	for key in list(ch):
+		node = ch[key]
+		if not isinstance(node, dict):
+			continue
+		if "ch" in node:
+			_migrate_ch(node["ch"], ref)
+			if not node["ch"]:
+				del node["ch"]
+		if "op" in node and not _migrate_node(node, ref):
+			for k in ("op", "set"):
+				node.pop(k, None)
+		if not node:
+			del ch[key]
+
+
+def migrate_diff(data):
+	"""Формат 3 -> 4: секунды, время текстом, короткие размеры, без tz; комментарии `c` сохраняются."""
+	ref = TimeRef(data["to"]["taken_at"])
+	data["format"] = FORMAT
+	for head in (data["from"], data["to"]):
+		head.pop("tz", None)
+	for group in data["groups"].values():
+		if not isinstance(group, dict):
+			continue
+		if "size" in group:
+			a, b = (parse_size(x) for x in group["size"][:2])
+			group["size"] = format_total_pair([a, b])
+		if "ch" in group:
+			_migrate_ch(group["ch"], ref)
+	scan = data.get("scan")
+	if scan and "ch" in scan:
+		_migrate_ch(scan["ch"], ref)
+	return data
+
+
+def _read_any(path):
+	with open(path, encoding="utf-8", errors="surrogateescape") as f:
+		return json.load(f)
+
+
+def check_chain(changes, paths):
+	"""Первый скан + все diff подряд должны дать последний скан. paths: имя -> путь к файлу нового формата."""
+	scans = list_scans(changes)
+	diffs = sorted(n for n in paths if DIFF_RE.match(n))
+	if len(scans) < 2 or not diffs:
+		return
+	first = _read_any(paths[scan_name(scans[0])])
+	last = _read_any(paths[scan_name(scans[-1])])
+	flat, current = flatten(first["tree"]), first["taken_at"]
+	for name in diffs:
+		d = _read_any(paths[name])
+		if d["from"]["taken_at"] != current:
+			raise ChkanError(f"цепочка diff прерывается перед {name}")
+		flat = apply_ops(flat, diff_ops(d), True)
+		current = d["to"]["taken_at"]
+	if current != last["taken_at"] or flat != flatten(last["tree"]):
+		raise ChkanError("первый скан и все diff не дают последний скан")
+
+
+def migrate_if_needed(changes, assume_yes=False):
+	"""Переводит файлы формата 3 в формат 4, оригиналы уходят в .changes/format3/. False: отказ."""
+	old = old_format_files(changes)
+	if not old:
+		return True
+	unknown = [(n, f) for n, f in old if f != 3]
+	if unknown:
+		raise ChkanError(f"неизвестный формат у {unknown[0][0]}: {unknown[0][1]!r}")
+	backup = os.path.join(changes, BACKUP_DIR)
+	if os.path.isdir(backup) and os.listdir(backup):
+		raise ChkanError(f"{backup} уже существует и не пуст: уберите его, прежде чем преобразовывать")
+	if not assume_yes and not ask(
+		f"В {changes} файлов формата 3: {len(old)}. Преобразовать в формат {FORMAT}? "
+		f"Оригиналы будут сохранены в {BACKUP_DIR}/ [y/N] "
+	):
+		msg("Отмена.")
+		return False
+	converted = {}
+	try:
+		for name, _fmt in old:
+			path = os.path.join(changes, name)
+			with make_stage(f"преобразование {name}", counted=False):
+				data = _read_any(path)
+				if SCAN_RE.match(name):
+					text = dumps_snapshot(migrate_snapshot(data))
+				else:
+					text = dumps_diff(migrate_diff(data)) + "\n"
+				with open(path + ".v4", "w", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
+					f.write(text)
+			converted[name] = path + ".v4"
+		paths = {n: converted.get(n, os.path.join(changes, n)) for n in os.listdir(changes) if SCAN_RE.match(n) or DIFF_RE.match(n)}
+		with make_stage("проверка: первый скан + все diff = последний скан", counted=False):
+			check_chain(changes, paths)
+	except BaseException:
+		for tmp in converted.values():
+			if os.path.exists(tmp):
+				os.remove(tmp)
+		raise
+	os.makedirs(backup, exist_ok=True)
+	for name, tmp in converted.items():
+		os.replace(os.path.join(changes, name), os.path.join(backup, name))
+		os.replace(tmp, os.path.join(changes, name))
+	msg(f"Преобразовано в формат {FORMAT}: {len(converted)} файлов, оригиналы в {backup}")
+	return True
+
+
+# ---------------------------------------------------------------- лог и wildcard
+
+
+def write_log(changes, now, comment, lines):
+	"""В .changes/chkan-log.txt: пустая строка, --- дата-время ---, комментарий, статистика."""
+	text = "\n--- " + now.strftime("%Y-%m-%d %H:%M:%S") + " ---\n"
+	if comment:
+		text += comment + "\n"
+	text += "".join(line + "\n" for line in lines)
+	try:
+		with open(os.path.join(changes, LOG_FILE), "a", encoding="utf-8", errors="surrogateescape") as f:
+			f.write(text)
+	except OSError as e:
+		msg(f"Предупреждение: не удалось записать {LOG_FILE}: {e.strerror}")
+
+
+def cmd_wildcard(root):
+	"""chkan.py wildcard: во что раскрываются пути с wildcard-ами из TAGS.txt (в stdout)."""
+	tags_path = os.path.join(root, CHANGES_DIR, TAGS_FILE)
+	if not os.path.isfile(tags_path):
+		raise ChkanError(f"нет файла {tags_path}")
+	with open(tags_path, encoding="utf-8", errors="surrogateescape") as f:
+		rules = parse_tags(f.read(), root, strict=False)
+	for lineno, pattern, paths in rules.wildcards:
+		print()
+		print(f"{lineno}: {pattern}")
+		for path in paths:
+			print(path)
+	return 0
+
+
 # ---------------------------------------------------------------- основной сценарий
 
 
-def run(root, assume_yes=False, warn_yes=False):
+def run(root, assume_yes=False, warn_yes=False, comment=None, show_progress=True):
+	global _progress_disabled
+	previous, _progress_disabled = _progress_disabled, not show_progress
+	try:
+		return _run(root, assume_yes, warn_yes, comment)
+	finally:
+		_progress_disabled = previous
+
+
+def _run(root, assume_yes, warn_yes, comment):
 	changes = os.path.join(root, CHANGES_DIR)
 	if not os.path.isdir(changes):
-		if not assume_yes:
-			try:
-				answer = input(f"Папка {changes} не найдена.\nСоздать её и сделать первый скан (может занять время)? [y/N] ")
-			except EOFError:
-				answer = ""
-			if answer.strip().lower() not in YES_ANSWERS:
-				print("Отмена.")
-				return 1
+		if not assume_yes and not ask(f"Папка {changes} не найдена.\nСоздать её и сделать первый скан (может занять время)? [y/N] "):
+			msg("Отмена.")
+			return 1
 		os.makedirs(changes)
-		tags_path = os.path.join(changes, TAGS_FILE)
-		if not os.path.exists(tags_path):
-			write_text_atomic(tags_path, TAGS_TEMPLATE)
+		if not os.path.exists(os.path.join(changes, TAGS_FILE)):
+			write_text_atomic(os.path.join(changes, TAGS_FILE), TAGS_TEMPLATE)
 	tags_path = os.path.join(changes, TAGS_FILE)
 	if not os.path.isfile(tags_path):
 		raise ChkanError(f"нет файла {tags_path}")
 	with open(tags_path, encoding="utf-8", errors="surrogateescape") as f:
-		rules = parse_tags(f.read())
+		rules = parse_tags(f.read(), root)
+	if not migrate_if_needed(changes, assume_yes):
+		return 1
 
 	scans = list_scans(changes)
 	prev = prev_flat = None
@@ -1374,37 +1779,39 @@ def run(root, assume_yes=False, warn_yes=False):
 	progress.finish()
 	printer.finish()
 
-	if warnings and not warn_yes:
-		try:
-			answer = input(f"При сканировании были предупреждения ({len(warnings)}). Продолжить и сохранить результат? [y/N] ")
-		except EOFError:
-			answer = ""
-		if answer.strip().lower() not in YES_ANSWERS:
-			print("Отмена: ничего не сохранено.")
-			return 1
+	if warnings and not warn_yes and not ask(
+		f"При сканировании были предупреждения ({len(warnings)}). Продолжить и сохранить результат? [y/N] "
+	):
+		msg("Отмена: ничего не сохранено.")
+		return 1
 
 	add_dir_totals(flat, stage=make_stage)
 	with make_stage("слепок: дерево", total=len(flat)) as pr:
 		snapshot = make_snapshot(root, now, rules, flat, pr)
+	scan_path = os.path.join(changes, scan_name(stamp))
 	with make_stage("слепок: запись", counted=False):
-		write_text_atomic(os.path.join(changes, scan_name(stamp)), dumps_snapshot(snapshot))
+		write_text_atomic(scan_path, dumps_snapshot(snapshot))
 
-	def finish(diff_path):
+	def finish(diff_path, lines):
+		write_log(changes, now, comment, lines)
 		env = {
 			"CHKAN_TAGS": os.path.abspath(tags_path),
 			"CHKAN_DIFF": os.path.abspath(diff_path) if diff_path else "",
-			"CHKAN_SCAN": os.path.abspath(os.path.join(changes, scan_name(stamp))),
+			"CHKAN_SCAN": os.path.abspath(scan_path),
+			"CHKAN_COMMENT": comment or "",
 		}
 		return 3 if run_hooks(root, rules.runs, env) else 0
 
 	if prev is None:
-		print(f"первый скан сохранён: {len(flat)} объектов ({scan_name(stamp)})")
-		return finish(None)
+		msg(f"первый скан сохранён: {len(flat)} объектов ({scan_name(stamp)})")
+		return finish(None, [f"первый скан: {len(flat)} объектов"])
 
-	diff = build_diff_flat(snapshot_head(prev), prev_flat, snapshot_head(snapshot), flat, rules, root, stage=make_stage)
+	diff = build_diff_flat(
+		snapshot_head(prev), prev_flat, snapshot_head(snapshot), flat, rules, root, stage=make_stage, comment=comment
+	)
 	diff_path = os.path.join(changes, diff_name(scans[-1], stamp))
 	with make_stage("diff: запись", counted=False):
-		write_text_atomic(diff_path, dumps_pretty(diff) + "\n")
+		write_text_atomic(diff_path, dumps_diff(diff) + "\n")
 
 	with make_stage("проверка: чтение diff", counted=False):
 		written = read_json(diff_path)
@@ -1420,24 +1827,38 @@ def run(root, assume_yes=False, warn_yes=False):
 	if scans[-1] != scans[0]:
 		os.remove(os.path.join(changes, scan_name(scans[-1])))
 
-	for line in format_summary(diff):
+	lines = format_summary(diff)
+	for line in lines:
 		print(line)
-	return finish(diff_path)
+	return finish(diff_path, lines)
 
 
 def main(argv=None):
 	parser = argparse.ArgumentParser(prog="chkan.py", description="Скан ФС и обратимый diff в ./.changes/")
-	parser.add_argument("dir", nargs="?", default=".", help="папка, в которой лежит .changes (по умолчанию текущая)")
-	parser.add_argument("-y", "--yes", action="store_true", help="не спрашивать подтверждение при создании .changes")
+	parser.add_argument(
+		"args", nargs="*", metavar="[wildcard] [папка]",
+		help="папка, в которой лежит .changes (по умолчанию текущая); слово wildcard вместо скана "
+		"показывает, во что раскрываются wildcard-ы из TAGS.txt (папку с таким именем задавайте как ./wildcard)",
+	)
+	parser.add_argument("-y", "--yes", action="store_true", help="не спрашивать при создании .changes и переходе на новый формат")
 	parser.add_argument(
 		"-w", "--warn-yes", action="store_true",
 		help="если при сканировании были предупреждения, не спрашивать, а продолжать",
 	)
+	parser.add_argument("-c", "--comment", metavar="КОММЕНТАРИЙ", help="комментарий к этому скану: в diff (ключ c), в лог и в $CHKAN_COMMENT")
+	parser.add_argument("-P", "--no-progress", action="store_true", help="не показывать прогресс-бары")
 	args = parser.parse_args(argv)
+	rest = list(args.args)
+	command = rest.pop(0) if rest and rest[0] == "wildcard" else None
+	if len(rest) > 1:
+		parser.error("лишние аргументы: " + " ".join(rest[1:]))
+	root = os.path.abspath(rest[0] if rest else ".")
 	try:
-		return run(os.path.abspath(args.dir), assume_yes=args.yes, warn_yes=args.warn_yes)
+		if command == "wildcard":
+			return cmd_wildcard(root)
+		return run(root, assume_yes=args.yes, warn_yes=args.warn_yes, comment=args.comment, show_progress=not args.no_progress)
 	except ChkanError as e:
-		print(f"Ошибка: {e}", file=sys.stderr)
+		msg(f"Ошибка: {e}")
 		return 2
 
 

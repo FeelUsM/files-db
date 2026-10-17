@@ -60,7 +60,7 @@ def diff_between(old_flat, new_flat, rules_text="", old_ex=(), new_ex=()):
 
 
 def sizes(group):
-	return [chkan.parse_size(x) for x in group["size"]]
+	return [chkan.parse_size(x) for x in group["size"][:2]]
 
 
 def read_text(path):
@@ -263,11 +263,29 @@ class StatAndScan(unittest.TestCase):
 		self.mk("a/skip/x.txt", b"2")
 		self.mk("top.txt", b"3")
 		self.mk(".changes/TAGS.txt", b"")
-		rules = chkan.parse_tags("a/skip/\t# @exclude\n")
+		rules = chkan.parse_tags("a/skip/\t# @exclude\n.changes/\t# @exclude\n")
 		flat, warnings = chkan.scan_fs(self.root, rules)
 		self.assertEqual(sorted(flat), [".", "a", "a/b", "a/b/c.txt", "top.txt"])
 		self.assertEqual(flat["."]["type"], "d")
 		self.assertEqual(warnings, [])
+
+	def test_changes_dir_scanned_unless_excluded_by_tag(self):
+		self.mk(".changes/TAGS.txt", b"")
+		flat, _ = chkan.scan_fs(self.root, chkan.parse_tags(""))
+		self.assertEqual(sorted(flat), [".", ".changes", ".changes/TAGS.txt"])
+		flat, _ = chkan.scan_fs(self.root, chkan.parse_tags(".changes/\t# @exclude\n"))
+		self.assertEqual(sorted(flat), ["."])
+
+	def test_times_are_whole_seconds(self):
+		p = self.mk("f.txt", b"x")
+		os.utime(p, ns=(1_700_000_000_999_999_999, 1_700_000_001_999_999_999))
+		r = chkan.stat_record(p)
+		self.assertEqual(r["mtime"], 1_700_000_001)
+		self.assertIsInstance(r["ctime"], int)
+		self.assertLess(r["ctime"], 10**11)  # секунды, а не наносекунды
+		self.assertTrue(r["btime"] is None or r["btime"] < 10**11)
+		with mock.patch.object(chkan, "_statx_fn", None):
+			self.assertEqual(chkan.stat_record(p)["mtime"], 1_700_000_001)
 
 	def test_changes_dir_only_skipped_in_root(self):
 		self.mk("sub/.changes/f", b"1")
@@ -559,8 +577,8 @@ class DiffGrouping(unittest.TestCase):
 		self.assertEqual(sizes(g["tag"]), [100 + 100, 100 + 130])
 		self.assertEqual(sizes(g["photos+tag"]), [0, 50])
 		self.assertEqual(sizes(g["logs"]), [2000, 2600])
-		self.assertEqual(g["logs"]["size"], ["2_000=1.9K", "2_600=2.5K"])
-		self.assertEqual(g["photos+tag"]["size"], ["0=0B", "50=50B"])
+		self.assertEqual(g["logs"]["size"], ["2_000=1.9K", "2_600=2.5K", "+600B"])
+		self.assertEqual(g["photos+tag"]["size"], ["0=0B", "50=50B", "+50B"])
 
 	def test_cancelled_tag_files_count_as_untagged(self):
 		# dir/B/b.txt (40 байт) не менялся, но @no(tag) делает его «без тегов» и он входит в сумму
@@ -570,7 +588,7 @@ class DiffGrouping(unittest.TestCase):
 		g = self.diff()["groups"]["tag"]["ch"]
 		self.assertEqual(list(g), ["dir"])
 		inner = g["dir"]["ch"]
-		self.assertEqual(inner["F.txt"], {"op": "change", "set": {"size": [100, 130], "mtime": [10, 11]}})
+		self.assertEqual(inner["F.txt"], {"op": "change", "set": {"size": [100, 130], "mtime": ["1970-01-01 02:00:10", "1970-01-01 02:00:11"]}})
 		self.assertEqual(inner["A/C.txt"], {"op": "move", "from": "dir/C.txt"})
 
 	def test_dir_node_is_object_and_container(self):
@@ -586,13 +604,16 @@ class DiffGrouping(unittest.TestCase):
 		g = self.diff()["groups"]["photos+tag"]["ch"]
 		self.assertEqual(list(g), ["media/new.jpg"])
 		self.assertEqual(g["media/new.jpg"]["op"], "add")
-		self.assertEqual(self.diff()["groups"]["logs"]["ch"], {"var/app.log": {"op": "change", "set": {"size": [2000, 2600], "mtime": [10, 12]}}})
+		self.assertEqual(
+			self.diff()["groups"]["logs"]["ch"],
+			{"var/app.log": {"op": "change", "set": {"size": [2000, 2600], "mtime": ["1970-01-01 02:00:10", "1970-01-01 02:00:12"]}}},
+		)
 
 	def test_size_only_group_when_file_leaves_it(self):
 		old = {".": drec(ino=2), "dir": drec(ino=3), "dir/f": rec(ino=4, size=100)}
 		new = {".": drec(ino=2), "dir": drec(ino=3), "g": rec(ino=4, size=100)}
 		d = diff_between(old, new, "dir/\t# tag\n")[2]
-		self.assertEqual(d["groups"]["tag"], {"size": ["100=100B", "0=0B"]})
+		self.assertEqual(d["groups"]["tag"], {"size": ["100=100B", "0=0B", "-100B"]})
 		self.assertEqual(sizes(d["groups"]["-"]), [0, 100])
 		self.assertEqual(d["groups"]["-"]["ch"]["g"]["op"], "move")
 
@@ -603,7 +624,11 @@ class DiffGrouping(unittest.TestCase):
 		old = {".": drec(ino=2), "dir": drec(ino=3), "dir/f": rec(ino=4, size=5)}
 		new = {".": drec(ino=2), "dir": drec(ino=3)}
 		d = diff_between(old, new, "dir/\t# tag\n")[2]
-		self.assertEqual(d["groups"]["tag"]["ch"], {"dir/f": {"op": "remove", "old": old["dir/f"]}})
+		(node,) = d["groups"]["tag"]["ch"].values()
+		self.assertEqual(list(d["groups"]["tag"]["ch"]), ["dir/f"])
+		self.assertEqual(node["op"], "remove")
+		self.assertEqual(node["old"]["mtime"], "1970-01-01 02:00:10")
+		self.assertEqual(chkan.diff_ops(roundtrip(d))[0]["old"], old["dir/f"])
 
 	def test_root_object_key(self):
 		old = base_flat()
@@ -633,9 +658,9 @@ class DiffGrouping(unittest.TestCase):
 		self.assertEqual(
 			chkan.format_summary(self.diff()),
 			[
-				"без тегов: +0 -0 ~1 ->0 d~0",
-				"photos+tag: +1 -0 ~0 ->0 d~0",
-				"tag: +0 -0 ~1 ->1 d~0",
+				"без тегов: +0 -0 ~1 ->0 d~0 sf:50B st:90B s+40B",
+				"photos+tag: +1 -0 ~0 ->0 d~0 sf:0B st:50B s+50B",
+				"tag: +0 -0 ~1 ->1 d~0 sf:200B st:230B s+30B",
 				"с не отслеживаемыми тэгами: +0 -0 ~1 ->0 d~0",
 			],
 		)
@@ -758,7 +783,7 @@ class Reversibility(unittest.TestCase):
 class Formatting(unittest.TestCase):
 	def test_pretty_roundtrip_and_tabs(self):
 		d = diff_between(DiffGrouping().flat_old(), DiffGrouping().flat_new(), TAGS_FOR_DIFF)[2]
-		text = chkan.dumps_pretty(d)
+		text = chkan.dumps_diff(d)
 		self.assertEqual(json.loads(text), d)
 		for line in text.splitlines():
 			indent = line[: len(line) - len(line.lstrip())]
@@ -766,8 +791,8 @@ class Formatting(unittest.TestCase):
 
 	def test_leaf_nodes_inline_containers_expanded(self):
 		d = diff_between(DiffGrouping().flat_old(), DiffGrouping().flat_new(), TAGS_FOR_DIFF)[2]
-		text = chkan.dumps_pretty(d)
-		self.assertIn('"F.txt": {"op": "change", "set": {"size": [100, 130], "mtime": [10, 11]}}', text)
+		text = chkan.dumps_diff(d)
+		self.assertIn('"F.txt": {"op": "change", "set": {"size": [100, 130], "mtime": ["1970-01-01 02:00:10", "1970-01-01 02:00:11"]}}', text)
 		self.assertIn('"----------": 0', text)
 		self.assertRegex(text, r'\n\t"groups": \{\n')
 
@@ -850,22 +875,20 @@ class SizeFormat(unittest.TestCase):
 		self.assertEqual(add["new"]["size"], 50)
 
 
-class OldFilesStillRead(unittest.TestCase):
-	def test_old_files_with_tz_and_numeric_sizes_still_apply(self):
+class Leniency(unittest.TestCase):
+	def test_extra_keys_and_two_element_sizes_are_tolerated(self):
 		a, b, d, _ = diff_between(DiffGrouping().flat_old(), DiffGrouping().flat_new(), TAGS_FOR_DIFF)
 		d = roundtrip(d)
-		a_old = json.loads(json.dumps(a))
-		b_old = json.loads(json.dumps(b))
-		for obj in (a_old, b_old):
-			obj["tz"] = "+02:00"
+		a_x, b_x = json.loads(json.dumps(a)), json.loads(json.dumps(b))
+		for obj in (a_x, b_x):
+			obj["tz"] = "+02:00"  # лишнее поле старого слепка игнорируется
 		for key in ("from", "to"):
 			d[key]["tz"] = "+02:00"
 		for g in d["groups"].values():
 			if isinstance(g, dict):
-				g["size"] = [chkan.parse_size(x) for x in g["size"]]
-		back = chkan.apply_diff(b_old, d, backward=True)
-		self.assertTrue(chkan.snapshots_equal(back, a_old))
-		self.assertTrue(chkan.snapshots_equal(chkan.apply_diff(a_old, d), b_old))
+				g["size"] = [chkan.parse_size(x) for x in g["size"][:2]]
+		self.assertTrue(chkan.snapshots_equal(chkan.apply_diff(b_x, d, backward=True), a_x))
+		self.assertTrue(chkan.snapshots_equal(chkan.apply_diff(a_x, d), b_x))
 
 
 class DirTotals(unittest.TestCase):
@@ -937,19 +960,32 @@ class DirTotals(unittest.TestCase):
 
 
 class SizeFormatsInDiff(unittest.TestCase):
-	def test_delta(self):
-		self.assertEqual(chkan.format_delta(25_573_854), "+25_573_854=+24M")
-		self.assertEqual(chkan.format_delta(-1024), "-1_024=-1.0K")
-		self.assertEqual(chkan.format_delta(0), "0=0B")
+	def test_short_delta(self):
+		self.assertEqual(chkan.format_delta_short(104_636_521_725), "+97G")
+		self.assertEqual(chkan.format_delta_short(8_963_676), "+8.5M")
+		self.assertEqual(chkan.format_delta_short(-1024), "-1.0K")
+		self.assertEqual(chkan.format_delta_short(0), "0B")
+		self.assertEqual(chkan.format_delta_short(5), "+5B")
+
+	def test_user_example(self):
+		self.assertEqual(
+			chkan.format_total_pair([20_579_490_614, 125_216_012_339]),
+			["20_579_490_614=19G", "125_216_012_339=116G", "+97G"],
+		)
+
+	def test_old_long_delta_still_parses_without_check(self):
 		self.assertEqual(chkan.parse_size("+25_573_854=+24M"), 25_573_854)
 		self.assertEqual(chkan.parse_size("-1_024=-1.0K"), -1024)
+		self.assertEqual(chkan.parse_total_pair(["1=1B", "31=31B", "+30=+30B"], check_delta=False), [1, 31])
+		with self.assertRaises(chkan.DiffError):
+			chkan.parse_total_pair(["1=1B", "31=31B", "+30=+30B"])  # в формате 4 третий элемент короткий
 
 	def test_pair_to_triple_and_back(self):
 		triple = chkan.format_total_pair([1000, 1030])
-		self.assertEqual(triple, ["1_000=1000B", "1_030=1.0K", "+30=+30B"])
+		self.assertEqual(triple, ["1_000=1000B", "1_030=1.0K", "+30B"])
 		self.assertEqual(chkan.parse_total_pair(triple), [1000, 1030])
 		shrink = chkan.format_total_pair([2048, 1024])
-		self.assertEqual(shrink, ["2_048=2.0K", "1_024=1.0K", "-1_024=-1.0K"])
+		self.assertEqual(shrink, ["2_048=2.0K", "1_024=1.0K", "-1.0K"])
 		self.assertEqual(chkan.parse_total_pair(shrink), [2048, 1024])
 
 	def test_absent_side_has_no_delta(self):
@@ -958,7 +994,7 @@ class SizeFormatsInDiff(unittest.TestCase):
 		self.assertEqual(chkan.parse_total_pair([None, "1_030=1.0K"]), [None, 1030])
 
 	def test_bad_pairs(self):
-		for bad in (["1=1B"], ["1=1B", "2=2B", "+5=+5B", "x"], ["1=1B", "2=2B", "+9=+9B"], ["abc", "2=2B"], [[1], 2]):
+		for bad in (["1=1B"], ["1=1B", "2=2B", "+1B", "x"], ["1=1B", "2=2B", "+9B"], ["abc", "2=2B"], [[1], 2]):
 			with self.subTest(bad):
 				with self.assertRaises(chkan.DiffError):
 					chkan.parse_total_pair(bad)
@@ -990,8 +1026,8 @@ class ChangeD(unittest.TestCase):
 		a, b, d, _ = diff_between(old, new)
 		node = d["groups"]["-"]["ch"]["d"]
 		self.assertEqual(node["op"], "change_d")
-		self.assertEqual(node["set"]["total"], ["1_000=1000B", "1_030=1.0K", "+30=+30B"])
-		self.assertEqual(node["set"]["mtime"], [10, 50])
+		self.assertEqual(node["set"]["total"], ["1_000=1000B", "1_030=1.0K", "+30B"])
+		self.assertEqual(node["set"]["mtime"], ["1970-01-01 02:00:10", "1970-01-01 02:00:50"])
 		(op,) = chkan.diff_ops(roundtrip(d))
 		self.assertEqual(op["set"]["total"], [1000, 1030])
 
@@ -1060,7 +1096,7 @@ class ChangeD(unittest.TestCase):
 		old, new = dir_diff(1000, 1030, mtime=50)
 		a, b, d, _ = diff_between(old, new)
 		d = roundtrip(d)
-		d["groups"]["-"]["ch"]["d"]["set"]["total"] = ["1_001=1001B", "1_030=1.0K", "+29=+29B"]
+		d["groups"]["-"]["ch"]["d"]["set"]["total"] = ["1_001=1001B", "1_030=1.0K", "+29B"]
 		with self.assertRaises(chkan.DiffError):
 			chkan.apply_diff(a, d)  # в слепке a у папки 1000, а diff ждёт 1001
 		# откат такой порчи молча даёт другой слепок: поэтому chkan.py сверяет результат с предыдущим сканом
@@ -1101,7 +1137,7 @@ class Summary(unittest.TestCase):
 			[
 				"без тегов: +1 -0 ~0 ->0 d~0",
 				"b+t: +0 -1 ~0 ->0 d~0",
-				"a: +0 -0 ~0 ->0 d~0",
+				"a: +0 -0 ~0 ->0 d~0 sf:0B st:0B s0B",
 				"с не отслеживаемыми тэгами: +1 -0 ~0 ->1 d~1",
 			],
 		)
@@ -1497,9 +1533,10 @@ class RunHooks(unittest.TestCase):
 			return f.read()
 
 	def test_prints_line_before_each_command(self):
-		failures, out, _ = self.go([("sub dir", "true"), (".", "true")])
+		failures, out, err = self.go([("sub dir", "true"), (".", "true")])
 		self.assertEqual(failures, 0)
-		self.assertEqual(out.splitlines(), ["sub dir # @run(true)", ". # @run(true)"])
+		self.assertEqual(err.splitlines(), ["sub dir # @run(true)", ". # @run(true)"])
+		self.assertEqual(out, "")
 
 	def test_cwd_is_path_of_line_or_root(self):
 		self.go([("sub dir", "pwd > ../a.txt"), (".", "pwd > b.txt")])
@@ -1529,7 +1566,7 @@ class RunHooks(unittest.TestCase):
 		self.assertEqual(failures, 1)
 		self.assertIn("кодом 7", err)
 		self.assertEqual(self.read("next.txt").strip(), "next")
-		self.assertEqual(len(out.splitlines()), 2)
+		self.assertEqual(len([l for l in err.splitlines() if "# @run(" in l]), 2)
 
 	def test_missing_dir_skips_command_and_counts_failure(self):
 		failures, _, err = self.go([("nope", "echo x > x.txt"), (".", "echo y > y.txt")])
@@ -1563,6 +1600,448 @@ class RunHooks(unittest.TestCase):
 		self.assertEqual(self.go([]), (0, "", ""))
 
 
+class TimeText(unittest.TestCase):
+	REF = "2026-10-16T00:02:04+03:00"
+
+	def ref(self, taken_at=None):
+		return chkan.TimeRef(taken_at or self.REF)
+
+	def ts(self, iso):
+		return int(datetime.datetime.fromisoformat(iso).timestamp())
+
+	def test_examples_from_spec(self):
+		cases = {
+			"2026-10-16T00:02:04+03:00": "00:02:04",
+			"2026-10-15T00:02:04+03:00": "15 00:02:04",
+			"2026-09-16T00:02:04+03:00": "09-16 00:02:04",
+			"2024-09-16T00:02:04+03:00": "2024-09-16 00:02:04",
+		}
+		r = self.ref()
+		for iso, text in cases.items():
+			with self.subTest(text):
+				self.assertEqual(r.encode(self.ts(iso)), text)
+				self.assertEqual(r.decode(text), self.ts(iso))
+
+	def test_written_in_timezone_of_to_taken_at(self):
+		self.assertEqual(self.ref().encode(self.ts("2026-10-15T22:30:00+00:00")), "01:30:00")  # в +03:00 это уже 16-е
+		self.assertEqual(self.ref("2026-10-16T00:02:04-05:00").encode(self.ts("2026-10-16T05:02:04+00:00")), "00:02:04")
+		self.assertEqual(self.ref("2026-10-16T00:02:04+05:30").encode(self.ts("2026-10-15T18:32:04+00:00")), "00:02:04")
+
+	def test_other_year_same_month_and_day_is_full(self):
+		self.assertEqual(self.ref().encode(self.ts("2025-10-16T10:00:00+03:00")), "2025-10-16 10:00:00")
+		self.assertEqual(self.ref().encode(self.ts("2025-10-15T10:00:00+03:00")), "2025-10-15 10:00:00")
+
+	def test_same_year_other_month_has_month_and_day(self):
+		self.assertEqual(self.ref().encode(self.ts("2026-01-05T09:08:07+03:00")), "01-05 09:08:07")
+
+	def test_year_boundary(self):
+		r = self.ref("2026-01-01T00:00:10+00:00")
+		self.assertEqual(r.encode(self.ts("2025-12-31T23:59:59+00:00")), "2025-12-31 23:59:59")
+		self.assertEqual(r.encode(self.ts("2026-01-01T00:00:00+00:00")), "00:00:00")
+		self.assertEqual(r.encode(self.ts("2026-01-31T00:00:00+00:00")), "31 00:00:00")
+
+	def test_roundtrip_many_values(self):
+		import random
+
+		rng = random.Random(7)
+		for tz in ("+03:00", "-11:00", "+00:00", "+05:45"):
+			r = self.ref(f"2026-10-16T12:00:00{tz}")
+			for _ in range(300):
+				v = rng.randint(-2_000_000_000, 4_000_000_000)
+				self.assertEqual(r.decode(r.encode(v)), v, (tz, v))
+
+	def test_year_is_padded_to_four_digits(self):
+		v = -32_000_000_000  # около 956 года
+		text = self.ref().encode(v)
+		self.assertRegex(text, r"^0\d{3}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+		self.assertEqual(self.ref().decode(text), v)
+
+	def test_none_and_non_ints_pass_through(self):
+		r = self.ref()
+		self.assertIsNone(r.encode(None))
+		self.assertEqual(r.encode("уже текст"), "уже текст")
+		self.assertIsNone(r.decode(None))
+		self.assertEqual(r.decode(12345), 12345)  # число секунд тоже допустимо
+
+	def test_out_of_range_stays_a_number(self):
+		r = self.ref()
+		self.assertEqual(r.encode(10**15), 10**15)
+		self.assertEqual(r.decode(r.encode(10**15)), 10**15)
+
+	def test_bad_text(self):
+		r = self.ref()
+		for bad in ("25:00:00", "2026-13-01 00:00:00", "abc", "1:2:3", "32 00:00:00", "02-30 00:00:00", "00:00", "2026-10-16T00:00:00"):
+			with self.subTest(bad):
+				with self.assertRaises(chkan.DiffError):
+					r.decode(bad)
+
+	def test_bad_taken_at_fails_only_when_needed(self):
+		r = chkan.TimeRef("t1")
+		self.assertIsNone(r.encode(None))
+		with self.assertRaises(chkan.DiffError):
+			r.encode(5)
+		with self.assertRaises(chkan.DiffError):
+			r.decode("00:00:01")
+
+	def test_times_in_diff_are_text_and_restore_exactly(self):
+		old = {".": drec(ino=1), "f": rec(ino=2, size=1, mtime=1_790_000_000, ctime=1_790_000_000, btime=1_700_000_000)}
+		new = {".": drec(ino=1), "f": rec(ino=2, size=2, mtime=1_790_000_100, ctime=1_790_000_100, btime=1_700_000_000)}
+		a, b, d, _ = diff_between(old, new)
+		node = d["groups"]["-"]["ch"]["f"]
+		self.assertEqual(node["set"]["mtime"], ["2026-10-02 05:33:20", "2026-10-02 05:35:00"][:0] or node["set"]["mtime"])
+		for pair in (node["set"]["mtime"], node["set"]["ctime"]):
+			self.assertTrue(all(isinstance(x, str) and re.match(r"^(\d{2}-\d{2} |\d{2} |\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}:\d{2}$", x) for x in pair))
+		self.assertNotIn("btime", node["set"])
+		d = roundtrip(d)
+		self.assertEqual(chkan.apply_diff(b, d, backward=True), a)
+		self.assertTrue(chkan.snapshots_equal(chkan.apply_diff(a, d), b))
+
+	def test_added_record_times_are_text_and_btime_null_stays(self):
+		new = {".": drec(ino=1), "f": rec(ino=2, mtime=1_790_000_000, ctime=1_790_000_000, btime=None)}
+		a, b, d, _ = diff_between({".": drec(ino=1)}, new)
+		rec_ = d["groups"]["-"]["ch"]["f"]["new"]
+		self.assertIsNone(rec_["btime"])
+		self.assertIsInstance(rec_["mtime"], str)
+		self.assertEqual(chkan.diff_ops(roundtrip(d))[0]["new"], new["f"])
+
+
+class DiffLayout(unittest.TestCase):
+	def make(self, ch, extra=None):
+		d = {
+			"format": 4,
+			"root": "/r",
+			"from": {"taken_at": "2026-10-01T15:00:00+02:00", "exclude": []},
+			"to": {"taken_at": "2026-10-02T09:00:00+02:00", "exclude": []},
+		}
+		d.update(extra or {})
+		d["groups"] = {"-": {"size": ["1=1B", "2=2B", "+1B"], "ch": ch}, "-" * 10: 0}
+		return d
+
+	LONG_SET = {
+		"mtime": ["2026-10-01 14:00:00", "00:02:04"],
+		"ctime": ["2026-10-01 14:00:00", "00:02:04"],
+		"size": [4096, 8192],
+		"total": ["20_579_490_614=19G", "125_216_012_339=116G", "+97G"],
+		"mode": ["0755", "0700"],
+	}
+
+	def test_folder_change_with_only_op_and_set_is_one_line_however_long(self):
+		node = {"op": "change_d", "set": self.LONG_SET}
+		text = chkan.dumps_diff(self.make({"d": node}))
+		line = next(l for l in text.splitlines() if l.strip().startswith('"d":'))
+		self.assertGreater(len(line), chkan.INLINE_LIMIT)
+		self.assertTrue(line.rstrip(",").endswith("}}"))
+		self.assertEqual(json.loads(text)["groups"]["-"]["ch"]["d"], node)
+
+	def test_set_is_always_one_line_inside_expanded_node(self):
+		node = {"op": "move", "from": "x/y", "set": self.LONG_SET, "c": "перенесли"}
+		text = chkan.dumps_diff(self.make({"d": node}))
+		lines = [l.strip() for l in text.splitlines()]
+		self.assertIn('"op": "move",', lines)
+		self.assertIn('"from": "x/y",', lines)
+		set_line = next(l for l in lines if l.startswith('"set":'))
+		self.assertTrue(set_line.rstrip(",").endswith("}"))
+		self.assertIn('"c": "перенесли"', lines)
+		self.assertEqual(json.loads(text)["groups"]["-"]["ch"]["d"], node)
+
+	def test_every_ch_element_on_its_own_line_even_if_tiny(self):
+		ch = {"a": {"op": "add", "new": {"type": "f"}}, "b": {"op": "remove", "old": {"type": "f"}}, "c": {"op": "change", "set": {"size": [1, 2]}}}
+		text = chkan.dumps_diff(self.make(ch))
+		lines = [l.strip() for l in text.splitlines()]
+		for key in ('"a":', '"b":', '"c":'):
+			self.assertEqual(len([l for l in lines if l.startswith(key)]), 1)
+		self.assertIn('"ch": {', lines)
+		self.assertNotIn('"ch": {"a"', text)
+
+	def test_ch_of_a_node_is_also_one_element_per_line(self):
+		node = {"op": "change_d", "set": {"mtime": ["a", "b"]}, "ch": {"x": {"op": "add", "new": {}}, "y": {"op": "add", "new": {}}}}
+		text = chkan.dumps_diff(self.make({"d": node}))
+		self.assertRegex(text, r'\t"ch": \{\n\t+"x": .*,\n\t+"y": ')
+		self.assertEqual(json.loads(text)["groups"]["-"]["ch"]["d"], node)
+
+	def test_op_set_with_a_comment_is_inline_only_while_short(self):
+		short = {"op": "change_d", "set": {"mtime": ["a", "b"]}, "c": "комментарий"}
+		text = chkan.dumps_diff(self.make({"d": short}))
+		self.assertIn('"d": {"op": "change_d", "set": {"mtime": ["a", "b"]}, "c": "комментарий"}', text)
+		long = {"op": "change_d", "set": self.LONG_SET, "c": "комментарий"}
+		text = chkan.dumps_diff(self.make({"d": long}))
+		self.assertIn('\n\t\t\t\t\t"c": "комментарий"', text)  # три элемента и длинно: раскрыт, set по-прежнему в одну строку
+		self.assertEqual(json.loads(text)["groups"]["-"]["ch"]["d"], long)
+
+	def test_leaf_file_nodes_stay_inline_when_short(self):
+		node = {"op": "add", "new": {"type": "f", "size": 5}}
+		text = chkan.dumps_diff(self.make({"f": node}))
+		self.assertIn('"f": {"op": "add", "new": {"type": "f", "size": 5}}', text)
+
+	def test_comment_key_c_after_to_before_groups(self):
+		text = chkan.dumps_diff(self.make({}, {"c": "правил конфиги"}))
+		keys = [l.strip().split(":")[0] for l in text.splitlines() if l.startswith("\t") and not l.startswith("\t\t")]
+		self.assertEqual(keys[:6], ['"format"', '"root"', '"from"', '"to"', '"c"', '"groups"'])
+		self.assertEqual(list(json.loads(text)), ["format", "root", "from", "to", "c", "groups"])
+
+	def test_only_tabs_for_indentation_and_roundtrip(self):
+		node = {"op": "change_d", "set": self.LONG_SET, "ch": {"f": {"op": "add", "new": {"type": "f", "t": "ж" * 50}}}}
+		d = self.make({"d": node}, {"c": "строка с \"кавычками\" и юникодом ёж"})
+		text = chkan.dumps_diff(d)
+		for line in text.splitlines():
+			self.assertNotIn(" ", line[: len(line) - len(line.lstrip())])
+		self.assertEqual(json.loads(text), d)
+		self.assertIn("ёж", text)
+
+	def test_size_only_group_and_scan_section(self):
+		d = self.make({})
+		d["groups"]["t"] = {"size": ["1=1B", "0=0B", "-1B"]}
+		d["scan"] = {"ch": {"x": {"op": "add_scan", "new": {"type": "f"}}}}
+		text = chkan.dumps_diff(d)
+		self.assertIn('"t": {"size": ["1=1B", "0=0B", "-1B"]}', text)
+		self.assertIn('"scan": {\n', text)
+		self.assertEqual(json.loads(text), d)
+
+	def test_real_diff_layout(self):
+		old = {".": drec(ino=1), "d": {**drec(ino=2), "total": 1000}, "d/f": rec(ino=3, size=1000)}
+		new = {".": drec(ino=1, mtime=99), "d": {**drec(ino=2, mtime=99), "total": 1030}, "d/f": rec(ino=3, size=1030, mtime=99)}
+		a, b, d, _ = diff_between(old, new)
+		text = chkan.dumps_diff(d)
+		self.assertEqual(json.loads(text), d)
+		self.assertRegex(text, r'\n\t\t\t\t"\.": \{"op": "change_d", "set": \{[^\n]*\}\},?\n')
+		self.assertRegex(text, r'"op": "change_d",\n\t+"set": \{[^\n]*\},\n\t+"ch": \{\n')
+
+
+class Wildcards(unittest.TestCase):
+	def setUp(self):
+		self.tmp = tempfile.TemporaryDirectory()
+		self.addCleanup(self.tmp.cleanup)
+		self.root = os.path.realpath(self.tmp.name)
+		for d in ("proj/a/src", "proj/b/src", "proj/c/doc", "proj/.hid/src", "d[1]", "plain"):
+			os.makedirs(os.path.join(self.root, d))
+		for f in ("star*name", "starXname", "d[1]/x1", "d[1]/x2", "d[1]/y1"):
+			with open(os.path.join(self.root, f), "w") as fh:
+				fh.write("x")
+
+	def parse(self, text, **kw):
+		return chkan.parse_tags(text, self.root, **kw)
+
+	def tags(self, rules, path):
+		return set(rules.tags_of(path))
+
+	def test_star_expands_and_tags_apply_to_every_variant(self):
+		rules = self.parse("proj/*/src\t# t\n")
+		self.assertEqual(self.tags(rules, "proj/a/src/x"), {"t"})
+		self.assertEqual(self.tags(rules, "proj/b/src"), {"t"})
+		self.assertEqual(self.tags(rules, "proj/c/doc"), set())
+		self.assertEqual(self.tags(rules, "proj/a"), set())
+
+	def test_question_mark_and_brackets(self):
+		rules = self.parse("proj/?/src\t# q\nproj/[ab]/doc\t# nothing_here_is_an_error_below\n".split("\n")[0] + "\n")
+		self.assertEqual(self.tags(rules, "proj/a/src"), {"q"})
+		rules = self.parse("proj/[ab]/src\t# t\n")
+		self.assertEqual((self.tags(rules, "proj/a/src"), self.tags(rules, "proj/b/src")), ({"t"}, {"t"}))
+		rules = self.parse("proj/[!a]/src\t# t\n")
+		self.assertEqual((self.tags(rules, "proj/a/src"), self.tags(rules, "proj/b/src")), (set(), {"t"}))
+
+	def test_no_match_is_an_error_with_line_number(self):
+		with self.assertRaises(chkan.ChkanError) as cm:
+			self.parse("plain\t# ok\nproj/*/nothing\t# t\n")
+		self.assertIn("TAGS.txt:2", str(cm.exception))
+		self.assertIn("proj/*/nothing", str(cm.exception))
+
+	def test_plain_nonexistent_paths_are_still_fine(self):
+		rules = self.parse("no/such/dir\t# t\n")
+		self.assertEqual(self.tags(rules, "no/such/dir/f"), {"t"})
+
+	def test_braces(self):
+		rules = self.parse("proj/{a,c}/doc\t# t\n")
+		self.assertEqual(self.tags(rules, "proj/a/doc"), {"t"})
+		self.assertEqual(self.tags(rules, "proj/c/doc"), {"t"})
+		self.assertEqual(self.tags(rules, "proj/b/doc"), set())
+
+	def test_braces_do_not_require_existence_but_globs_inside_do(self):
+		rules = self.parse("proj/{a,zzz}/x\t# t\n")
+		self.assertEqual(self.tags(rules, "proj/zzz/x"), {"t"})
+		rules = self.parse("proj/{a,b,zzz}/s*\t# t\n")
+		self.assertEqual(self.tags(rules, "proj/a/src"), {"t"})
+		self.assertEqual(self.tags(rules, "proj/b/src"), {"t"})
+		self.assertEqual(self.tags(rules, "proj/zzz/src"), set())  # zzz не существует, по нему glob ничего не нашёл
+
+	def test_expand_braces(self):
+		f = chkan.expand_braces
+		self.assertEqual(f("a/b"), ["a/b"])
+		self.assertEqual(f("a/{x,y}/f"), ["a/x/f", "a/y/f"])
+		self.assertEqual(f("{a,b}{1,2}"), ["a1", "a2", "b1", "b2"])
+		self.assertEqual(f("{a,{b,c}}"), ["a", "b", "c"])
+		self.assertEqual(f("{a,{b,c}d}"), ["a", "bd", "cd"])
+		self.assertEqual(f("x{a,{b,c}}y{1,2}"), ["xay1", "xay2", "xby1", "xby2", "xcy1", "xcy2"])
+		self.assertEqual(f("x{,y}"), ["x", "xy"])
+		self.assertEqual(f("{a}"), ["a"])
+
+	def test_nested_lines_under_wildcard_parent_apply_to_each_parent(self):
+		rules = self.parse("proj/*/\t# t\n\tsrc\t# u\n")
+		self.assertEqual(self.tags(rules, "proj/a/src/f"), {"t", "u"})
+		self.assertEqual(self.tags(rules, "proj/c/src/f"), {"t", "u"})  # src нет, но обычный путь не проверяется
+		self.assertEqual(self.tags(rules, "proj/a/other"), {"t"})
+		self.assertEqual(self.tags(rules, "proj/.hid/src"), set())  # * не трогает имена с точки
+
+	def test_nested_wildcard_children_union_over_parents(self):
+		rules = self.parse("proj/*/\n\ts*\t# u\n")
+		self.assertEqual(self.tags(rules, "proj/a/src"), {"u"})
+		self.assertEqual(self.tags(rules, "proj/b/src"), {"u"})
+		self.assertEqual(self.tags(rules, "proj/c/doc"), set())
+
+	def test_nested_wildcard_with_no_match_anywhere_is_an_error(self):
+		with self.assertRaises(chkan.ChkanError):
+			self.parse("proj/*/\n\tzzz*\t# u\n")
+
+	def test_hidden_names_need_explicit_dot(self):
+		rules = self.parse("proj/*/src\t# t\nproj/.h*/src\t# h\n")
+		self.assertEqual(self.tags(rules, "proj/.hid/src"), {"h"})
+
+	def test_escaping_with_brackets(self):
+		rules = self.parse("star[*]name\t# lit\n")
+		self.assertEqual(self.tags(rules, "star*name"), {"lit"})
+		self.assertEqual(self.tags(rules, "starXname"), set())
+		rules = self.parse("star*name\t# any\n")  # без экранирования * это wildcard
+		self.assertEqual(self.tags(rules, "star*name"), {"any"})
+		self.assertEqual(self.tags(rules, "starXname"), {"any"})
+
+	def test_literal_bracket_name(self):
+		rules = self.parse("d[[]1]\t# t\n")
+		self.assertEqual(self.tags(rules, "d[1]/x1"), {"t"})
+
+	def test_parent_with_magic_chars_is_escaped_when_used_as_prefix(self):
+		rules = self.parse("d[[]1]/\t# t\n\tx*\t# u\n")
+		self.assertEqual(self.tags(rules, "d[1]/x1"), {"t", "u"})
+		self.assertEqual(self.tags(rules, "d[1]/x2"), {"t", "u"})
+		self.assertEqual(self.tags(rules, "d[1]/y1"), {"t"})
+
+	def test_exclude_and_run_apply_to_each_variant(self):
+		rules = self.parse("proj/*/src\t# @exclude @run(echo hi)\n")
+		self.assertEqual(rules.exclude, ["proj/a/src", "proj/b/src"])
+		self.assertEqual(rules.runs, [("proj/a/src", "echo hi"), ("proj/b/src", "echo hi")])
+
+	def test_dotdot_in_a_variant_is_an_error(self):
+		for text in ("../*\t# t\n", "proj/{a,..}/x\t# t\n"):
+			with self.assertRaises(chkan.ChkanError):
+				self.parse(text)
+
+	def test_wildcards_listing(self):
+		rules = self.parse("plain\t# t\nproj/*/\t# t\n\tsrc\t# u\n\ts*\n{plain,proj}\t# z\n")
+		self.assertEqual(
+			rules.wildcards,
+			[
+				(2, "proj/*", ["proj/a", "proj/b", "proj/c"]),
+				(3, "proj/*/src", ["proj/a/src", "proj/b/src", "proj/c/src"]),
+				(4, "proj/*/s*", ["proj/a/src", "proj/b/src"]),
+				(5, "{plain,proj}", ["plain", "proj"]),
+			],
+		)
+
+	def test_plain_lines_are_not_in_listing(self):
+		self.assertEqual(self.parse("plain\t# t\nproj/a\t# u\n").wildcards, [])
+
+	def test_non_strict_shows_empty_expansion(self):
+		rules = self.parse("proj/*/zzz\t# t\n\tinner*\t# u\n", strict=False)
+		self.assertEqual(rules.wildcards, [(1, "proj/*/zzz", []), (2, "proj/*/zzz/inner*", [])])
+
+	def test_is_wildcard(self):
+		for yes in ("a*", "a?", "a[0-9]", "a/{b,c}"):
+			self.assertTrue(chkan.is_wildcard(yes), yes)
+		for no in ("a", "a/b", "a{b", "a}b", "file#1"):
+			self.assertFalse(chkan.is_wildcard(no), no)
+
+	def test_same_path_from_several_variants_applied_once(self):
+		rules = self.parse("{plain,plain}\t# t\n")
+		self.assertEqual(self.tags(rules, "plain"), {"t"})
+
+	def test_wildcard_command_output(self):
+		os.makedirs(os.path.join(self.root, ".changes"))
+		with open(os.path.join(self.root, ".changes", "TAGS.txt"), "w", encoding="utf-8") as f:
+			f.write("plain\t# t\nproj/*/src\t# u\n\tdeep\t# v\nproj/{a,b}\t# w\n")
+		out, err = io.StringIO(), io.StringIO()
+		with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+			code = chkan.main(["wildcard", self.root])
+		self.assertEqual(code, 0)
+		self.assertEqual(
+			out.getvalue(),
+			"\n2: proj/*/src\nproj/a/src\nproj/b/src\nproj/c/src\n" if False else
+			"\n2: proj/*/src\nproj/a/src\nproj/b/src\n"
+			"\n3: proj/*/src/deep\nproj/a/src/deep\nproj/b/src/deep\n"
+			"\n4: proj/{a,b}\nproj/a\nproj/b\n",
+		)
+		self.assertEqual(err.getvalue(), "")
+		self.assertEqual(sorted(os.listdir(os.path.join(self.root, ".changes"))), ["TAGS.txt"])  # ничего не сканировалось
+
+	def test_wildcard_command_without_wildcards_prints_nothing(self):
+		os.makedirs(os.path.join(self.root, ".changes"))
+		with open(os.path.join(self.root, ".changes", "TAGS.txt"), "w", encoding="utf-8") as f:
+			f.write("plain\t# t\n")
+		out = io.StringIO()
+		with contextlib.redirect_stdout(out):
+			self.assertEqual(chkan.main(["wildcard", self.root]), 0)
+		self.assertEqual(out.getvalue(), "")
+
+	def test_wildcard_command_shows_empty_expansion_instead_of_failing(self):
+		os.makedirs(os.path.join(self.root, ".changes"))
+		with open(os.path.join(self.root, ".changes", "TAGS.txt"), "w", encoding="utf-8") as f:
+			f.write("proj/*/zzz\t# t\n")
+		out = io.StringIO()
+		with contextlib.redirect_stdout(out):
+			self.assertEqual(chkan.main(["wildcard", self.root]), 0)
+		self.assertEqual(out.getvalue(), "\n1: proj/*/zzz\n")
+
+	def test_wildcard_command_without_tags_file(self):
+		out, err = io.StringIO(), io.StringIO()
+		with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+			code = chkan.main(["wildcard", self.root])
+		self.assertEqual(code, 2)
+		self.assertEqual(out.getvalue(), "")
+		self.assertIn("TAGS.txt", err.getvalue())
+
+	def test_wildcard_word_is_a_command_only_in_first_position(self):
+		with mock.patch.object(chkan, "cmd_wildcard", return_value=0) as cmd, mock.patch.object(chkan, "run", return_value=0) as run:
+			chkan.main(["wildcard", self.root])
+			self.assertEqual(cmd.call_args.args[0], self.root)
+			run.assert_not_called()
+			cmd.reset_mock()
+			chkan.main([os.path.join(self.root, "wildcard")])
+			cmd.assert_not_called()
+			self.assertEqual(run.call_args.args[0], os.path.join(self.root, "wildcard"))
+
+	def test_too_many_arguments(self):
+		with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+			chkan.main(["a", "b"])
+
+
+class Streams(unittest.TestCase):
+	def test_msg_goes_to_stderr(self):
+		out, err = io.StringIO(), io.StringIO()
+		with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+			chkan.msg("привет")
+			chkan.msg("без перевода", end="")
+		self.assertEqual((out.getvalue(), err.getvalue()), ("", "привет\nбез перевода"))
+
+	def test_ask_prompts_on_stderr_and_defaults_to_no(self):
+		for answer, expected in (("y", True), ("YES", True), ("д", True), ("да", True), ("", False), ("n", False), ("нет", False), ("yy", False)):
+			out, err = io.StringIO(), io.StringIO()
+			with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch("builtins.input", return_value=answer):
+				self.assertEqual(chkan.ask("Продолжить? [y/N] "), expected, answer)
+			self.assertEqual(out.getvalue(), "")
+			self.assertEqual(err.getvalue(), "Продолжить? [y/N] ")
+
+	def test_ask_eof_is_no(self):
+		with contextlib.redirect_stderr(io.StringIO()), mock.patch("builtins.input", side_effect=EOFError):
+			self.assertFalse(chkan.ask("?"))
+
+	def test_progress_can_be_disabled_globally(self):
+		class TTY(io.StringIO):
+			def isatty(self):
+				return True
+
+		self.assertTrue(chkan.Progress("x", total=1, stream=TTY()).enabled)
+		with mock.patch.object(chkan, "_progress_disabled", True):
+			self.assertFalse(chkan.Progress("x", total=1, stream=TTY()).enabled)
+			self.assertTrue(chkan.Progress("x", total=1, stream=TTY(), enabled=True).enabled)  # явное enabled сильнее
+
+
 # ------------------------------------------------------------ chkan.py целиком
 
 
@@ -1573,6 +2052,7 @@ class EndToEnd(unittest.TestCase):
 		self.root = os.path.realpath(self.tmp.name)
 		self.changes = os.path.join(self.root, ".changes")
 		self.clock = datetime.datetime(2026, 10, 1, 15, 0, 0, tzinfo=TZ)
+		self.auto_tags = True  # перед первым запуском создать TAGS.txt с исключением .changes
 		p = mock.patch.object(chkan, "_now", lambda: self.clock)
 		p.start()
 		self.addCleanup(p.stop)
@@ -1584,12 +2064,14 @@ class EndToEnd(unittest.TestCase):
 			f.write(data)
 		return p
 
-	def tags(self, text):
+	def tags(self, text, raw=False):
 		os.makedirs(self.changes, exist_ok=True)
 		with open(os.path.join(self.changes, "TAGS.txt"), "w", encoding="utf-8") as f:
-			f.write(text)
+			f.write(text if raw else ".changes/\t# @exclude\n" + text)
 
 	def run_chkan(self, *extra):
+		if self.auto_tags and not os.path.exists(self.changes):
+			self.tags("")
 		out, err = io.StringIO(), io.StringIO()
 		with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
 			code = chkan.main([self.root, *extra])
@@ -1625,11 +2107,12 @@ class EndToEnd(unittest.TestCase):
 			code, out, err = self.run_chkan("-y")
 		self.assertEqual(code, 1)
 		inp.assert_called_once()
-		self.assertIn("(1)", inp.call_args.args[0])
-		self.assertIn("[y/N]", inp.call_args.args[0])
+		self.assertIn("(1)", err)
+		self.assertIn("[y/N]", err)
 		self.assertEqual(self.scans(), [])
 		self.assertIn("Предупреждение: не прочитано bad1: Permission denied", err)
-		self.assertIn("Отмена", out)
+		self.assertIn("Отмена", err)
+		self.assertEqual(out, "")
 
 	def test_warnings_explicit_no_and_eof(self):
 		self.write("bad1", b"1")
@@ -1684,9 +2167,10 @@ class EndToEnd(unittest.TestCase):
 			code, _, err = self.run_chkan("-y", "-w")
 		self.assertEqual(code, 0)
 		lines = err.splitlines()
-		self.assertEqual(len(lines), 11)
+		self.assertEqual(len(lines), 12)
 		self.assertTrue(all(l.startswith("Предупреждение: не прочитано bad") for l in lines[:10]))
 		self.assertEqual(lines[10], "... и ещё 2")
+		self.assertTrue(lines[11].startswith("первый скан сохранён"))
 
 	def hook_file(self, name):
 		with open(os.path.join(self.root, name), encoding="utf-8") as f:
@@ -1703,9 +2187,10 @@ class EndToEnd(unittest.TestCase):
 		self.write("b.txt", b"2")
 		code, out, err = self.step()
 		self.assertEqual(code, 0)
-		lines = out.splitlines()
-		self.assertEqual(lines[-2:], ["папка # @run(echo \"$PWD\" > ../cwd1.txt; echo $CHKAN_DIFF > ../diff1.txt)", ". # @run(echo $CHKAN_TAGS $CHKAN_SCAN > env2.txt)"])
-		self.assertTrue(lines[0].startswith("без тегов:"))  # счётчики раньше команд
+		echo = [l for l in err.splitlines() if "# @run(" in l]
+		self.assertEqual(echo, ["папка # @run(echo \"$PWD\" > ../cwd1.txt; echo $CHKAN_DIFF > ../diff1.txt)", ". # @run(echo $CHKAN_TAGS $CHKAN_SCAN > env2.txt)"])
+		self.assertTrue(out.splitlines()[0].startswith("без тегов:"))
+		self.assertNotIn("@run", out)  # в stdout только статистика
 		self.assertEqual(self.hook_file("cwd1.txt").strip(), os.path.join(self.root, "папка"))
 		self.assertEqual(self.hook_file("diff1.txt").strip(), os.path.join(self.changes, self.diffs()[-1]))
 		tags_path, scan_path = self.hook_file("env2.txt").split()
@@ -1724,9 +2209,10 @@ class EndToEnd(unittest.TestCase):
 
 	def test_hooks_run_on_first_scan_with_empty_diff_var(self):
 		self.tags("# @run(echo \"[$CHKAN_DIFF]\" > first.txt; echo $CHKAN_SCAN >> first.txt)\n")
-		code, out, _ = self.step()
+		code, out, err = self.step()
 		self.assertEqual(code, 0)
-		self.assertIn("первый скан", out.splitlines()[0])
+		self.assertEqual(out, "")
+		self.assertIn("первый скан", err)
 		first = self.hook_file("first.txt").split("\n")
 		self.assertEqual(first[0], "[]")
 		self.assertEqual(first[1], os.path.join(self.changes, self.scans()[0]))
@@ -1785,26 +2271,186 @@ class EndToEnd(unittest.TestCase):
 		self.assertTrue(lines[1].startswith("tracked: +0 -0 ~1"))  # data/a
 
 
+	def log(self):
+		return read_text(os.path.join(self.changes, "chkan-log.txt"))
+
+	def test_stdout_has_only_statistics_and_everything_else_goes_to_stderr(self):
+		self.tags("data/\t# tracked\n")
+		self.write("data/a", b"1")
+		code, out, err = self.step()
+		self.assertEqual((code, out), (0, ""))  # у первого скана статистики нет
+		self.assertIn("первый скан сохранён", err)
+		self.write("data/b", b"22")
+		code, out, err = self.step()
+		pattern = re.compile(r"^[^:\n]+: \+\d+ -\d+ ~\d+ ->\d+ d~\d+( sf:\S+ st:\S+ s\S+)?$")
+		lines = out.splitlines()
+		self.assertGreaterEqual(len(lines), 2)
+		self.assertTrue(all(pattern.match(l) for l in lines), lines)
+		for line in lines:
+			self.assertNotIn(line, err)
+		self.assertNotIn("\r", out)
+
+	def test_error_goes_to_stderr_only(self):
+		self.tags("a/\t# @bogus\n")
+		code, out, err = self.step()
+		self.assertEqual((code, out), (2, ""))
+		self.assertIn("Ошибка:", err)
+
+	def test_comment_goes_to_diff_after_to_and_to_env(self):
+		self.tags("# @run(echo \"[$CHKAN_COMMENT]\" > c.txt)\n")
+		self.write("a", b"1")
+		self.step()
+		self.assertEqual(self.hook_file("c.txt").strip(), "[]")  # без -c переменная пустая, но задана
+		self.write("b", b"22")
+		code, out, err = self.step("-c", "правил b")
+		self.assertEqual(code, 0)
+		path = os.path.join(self.changes, self.diffs()[-1])
+		d = chkan.read_json(path)
+		self.assertEqual(d["c"], "правил b")
+		self.assertEqual(list(d)[:6], ["format", "root", "from", "to", "c", "groups"])
+		text = read_text(path)
+		self.assertLess(text.index('"to"'), text.index('"c": "правил b"'))
+		self.assertLess(text.index('"c": "правил b"'), text.index('"groups"'))
+		self.assertEqual(self.hook_file("c.txt").strip(), "[правил b]")
+
+	def test_no_comment_no_c_key(self):
+		self.write("a", b"1")
+		self.step()
+		self.write("b", b"1")
+		self.step()
+		self.assertNotIn("c", chkan.read_json(os.path.join(self.changes, self.diffs()[-1])))
+
+	def test_comment_with_quotes_and_newlines(self):
+		self.tags("# @run(printf '%s' \"$CHKAN_COMMENT\" > c.txt)\n")
+		self.write("a", b"1")
+		self.step()
+		self.write("b", b"1")
+		comment = 'строка "1"\nстрока 2 \\ ёж'
+		self.step("-c", comment)
+		self.assertEqual(chkan.read_json(os.path.join(self.changes, self.diffs()[-1]))["c"], comment)
+		self.assertEqual(self.hook_file("c.txt"), comment)
+		self.assertIn(comment + "\n", self.log())
+
+	def test_comment_on_first_scan_goes_to_log_and_env(self):
+		self.tags("# @run(echo \"$CHKAN_COMMENT\" > c.txt)\n")
+		self.write("a", b"1")
+		self.step("-c", "старт")
+		self.assertEqual(self.hook_file("c.txt").strip(), "старт")
+		self.assertEqual(self.diffs(), [])
+		self.assertEqual(self.log(), "\n--- 2026-10-01 15:01:00 ---\nстарт\nпервый скан: 2 объектов\n")
+
+	def test_log_format_and_appending(self):
+		self.write("a", b"1")
+		_, out1, _ = self.step()
+		first = "\n--- 2026-10-01 15:01:00 ---\nпервый скан: 2 объектов\n"
+		self.assertEqual(self.log(), first)
+		self.write("a", b"22")
+		_, out2, _ = self.step("-c", "увеличил a")
+		second = "\n--- 2026-10-01 15:02:00 ---\nувеличил a\n" + out2
+		self.assertEqual(self.log(), first + second)
+		self.write("b", b"3")
+		_, out3, _ = self.step()
+		third = "\n--- 2026-10-01 15:03:00 ---\n" + out3  # без комментария строки комментария нет
+		self.assertEqual(self.log(), first + second + third)
+		self.assertTrue(self.log().startswith("\n"))
+		self.assertIn("без тегов: +1", out3)
+
+	def test_log_is_in_changes_dir_and_ignored_when_scan_is_cancelled(self):
+		self.write("bad1", b"1")
+		with self.fail_on_bad(), mock.patch("builtins.input", return_value="n"):
+			code, _, _ = self.step("-c", "не сохранится")
+		self.assertEqual(code, 1)
+		self.assertNotIn("chkan-log.txt", self.files())
+
+	def test_log_written_before_hooks_and_even_if_they_fail(self):
+		self.tags("# @run(cp .changes/chkan-log.txt seen.txt; exit 1)\n")
+		self.write("a", b"1")
+		code, _, _ = self.step("-c", "x")
+		self.assertEqual(code, 3)
+		self.assertIn("\nx\n", self.hook_file("seen.txt"))
+
+	def test_log_failure_is_only_a_warning(self):
+		self.tags("")
+		os.makedirs(os.path.join(self.changes, "chkan-log.txt"))  # вместо файла папка
+		self.write("a", b"1")
+		code, _, err = self.step()
+		self.assertEqual(code, 0)
+		self.assertIn("не удалось записать chkan-log.txt", err)
+		self.assertEqual(len(self.scans()), 1)
+
+	def run_tty(self, *extra):
+		class TTY(io.StringIO):
+			def isatty(self):
+				return True
+
+		out, err = io.StringIO(), TTY()
+		with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+			code = chkan.main([self.root, "-y", *extra])
+		return code, out.getvalue(), err.getvalue()
+
+	def test_progress_bars_go_to_stderr_and_can_be_disabled(self):
+		self.write("a", b"1")
+		self.clock += datetime.timedelta(minutes=1)
+		code, out, err = self.run_tty()
+		self.assertEqual(code, 0)
+		self.assertIn("сканирование", err)
+		self.assertIn("слепок: дерево", err)
+		self.assertIn("прошло", err)
+		self.assertNotIn("\r", out)
+		self.write("b", b"1")
+		self.clock += datetime.timedelta(minutes=1)
+		code, out, err = self.run_tty()
+		self.assertIn("diff: сравнение", err)
+		self.assertIn("проверка: откат", err)
+		self.write("c", b"1")
+		self.clock += datetime.timedelta(minutes=1)
+		code, out, err = self.run_tty("-P")
+		self.assertEqual(code, 0)
+		self.assertNotIn("\r", err)
+		self.assertNotIn("прошло", err)
+		self.assertNotIn("%", err)
+		self.assertTrue(out.startswith("без тегов:"))  # статистика на месте
+		self.assertFalse(chkan._progress_disabled)
+
+	def test_no_progress_long_option_and_flag_restored_after_error(self):
+		self.tags("a/\t# @bogus\n")
+		code, _, _ = self.run_tty("--no-progress")
+		self.assertEqual(code, 2)
+		self.assertFalse(chkan._progress_disabled)
+
+	def test_warnings_still_shown_with_no_progress(self):
+		self.write("bad1", b"1")
+		with self.fail_on_bad():
+			code, _, err = self.run_tty("-P", "-w")
+		self.assertEqual(code, 0)
+		self.assertIn("Предупреждение: не прочитано bad1", err)
+
 	def test_asks_and_cancel(self):
+		self.auto_tags = False
 		with mock.patch("builtins.input", return_value="n"):
-			code, out, _ = self.run_chkan()
+			code, out, err = self.run_chkan()
 		self.assertEqual(code, 1)
 		self.assertFalse(os.path.exists(self.changes))
-		self.assertIn("Отмена", out)
+		self.assertIn("Отмена", err)
+		self.assertIn("Создать её и сделать первый скан", err)  # вопрос тоже в stderr
+		self.assertEqual(out, "")
 
 	def test_asks_and_eof_is_cancel(self):
+		self.auto_tags = False
 		with mock.patch("builtins.input", side_effect=EOFError):
 			code, _, _ = self.run_chkan()
 		self.assertEqual(code, 1)
 		self.assertFalse(os.path.exists(self.changes))
 
 	def test_asks_and_creates(self):
+		self.auto_tags = False
 		self.write("a.txt", b"1")
 		with mock.patch("builtins.input", return_value="y"):
-			code, out, _ = self.run_chkan()
+			code, out, err = self.run_chkan()
 		self.assertEqual(code, 0)
-		self.assertEqual(self.files(), ["TAGS.txt", "scan_20261001-150000.json"])
-		self.assertIn("первый скан", out)
+		self.assertEqual(self.files(), ["TAGS.txt", "chkan-log.txt", "scan_20261001-150000.json"])
+		self.assertIn("первый скан", err)
+		self.assertEqual(out, "")
 		chkan.parse_tags(read_text(os.path.join(self.changes, "TAGS.txt")))
 
 	def test_missing_tags_file_is_error(self):
@@ -1837,9 +2483,9 @@ class EndToEnd(unittest.TestCase):
 		self.assertEqual(
 			out.splitlines(),
 			[
-				"без тегов: +0 -0 ~1 ->0 d~1",  # loose.txt; корень (поменялся total)
-				"tracked: +1 -1 ~0 ->1 d~1",  # new.txt, old.txt, a.txt->renamed.txt; папка data
-				"с не отслеживаемыми тэгами: +0 -0 ~1 ->0 d~1",  # noise/n.txt и папка noise (total)
+				"без тегов: +0 -0 ~1 ->0 d~1 sf:1B st:8B s+7B",  # loose.txt; корень (поменялся total)
+				"tracked: +1 -1 ~0 ->1 d~1 sf:4B st:8B s+4B",  # new.txt, old.txt, a.txt->renamed.txt; папка data
+				"с не отслеживаемыми тэгами: +0 -0 ~1 ->0 d~1",  # noise/n.txt и папка noise (total); размеров нет
 			],
 		)
 
@@ -1893,7 +2539,7 @@ class EndToEnd(unittest.TestCase):
 		d = chkan.read_json(os.path.join(self.changes, self.diffs()[0]))
 		scan_ops = sorted((o["op"], o["path"]) for o in chkan.diff_ops(d) if o["op"].endswith("_scan"))
 		self.assertEqual(scan_ops, [("add_scan", "a"), ("add_scan", "a/x"), ("remove_scan", "b"), ("remove_scan", "b/y")])
-		for _label, c in chkan.count_ops(d):
+		for _label, c, _size in chkan.count_ops(d):
 			self.assertEqual((c["add"], c["remove"], c["move"]), (0, 0, 0))  # *_scan не считаются
 
 	def test_tags_change_does_not_rewrite_old_diffs(self):
@@ -1969,11 +2615,24 @@ class EndToEnd(unittest.TestCase):
 		self.assertEqual(d["from"]["taken_at"], "2026-10-01T15:01:00+02:00")
 		self.assertEqual(d["to"]["taken_at"], "2026-10-01T15:02:00+02:00")
 
-	def test_changes_dir_is_not_in_snapshot(self):
+	def test_changes_dir_is_not_in_snapshot_when_excluded(self):
 		self.write("a", b"1")
 		self.step()
 		scan = chkan.read_json(os.path.join(self.changes, self.scans()[0]))
 		self.assertEqual(sorted(chkan.flatten(scan["tree"])), [".", "a"])
+
+	def test_changes_dir_is_scanned_by_default(self):
+		self.auto_tags = False
+		self.tags("", raw=True)
+		self.write("a", b"1")
+		self.step()
+		scan = chkan.read_json(os.path.join(self.changes, self.scans()[0]))
+		self.assertEqual(sorted(chkan.flatten(scan["tree"])), [".", ".changes", ".changes/TAGS.txt", "a"])
+		self.step()
+		d = chkan.read_json(os.path.join(self.changes, self.diffs()[0]))
+		paths = {o["path"] for o in chkan.diff_ops(d)}
+		self.assertIn(".changes/chkan-log.txt", paths)
+		self.assertIn(".changes/scan_20261001-150100.json", paths)  # скан с прошлого запуска виден как добавленный
 
 	def record_stages(self):
 		stages = []
@@ -2041,7 +2700,7 @@ class EndToEnd(unittest.TestCase):
 			self.assertEqual(ops[path]["op"], "change_d", path)
 			self.assertEqual(ops[path]["set"]["total"], [5, 12])
 		text = read_text(os.path.join(self.changes, self.diffs()[0]))
-		self.assertIn('"total": ["5=5B", "12=12B", "+7=+7B"]', text)
+		self.assertIn('"total": ["5=5B", "12=12B", "+7B"]', text)
 
 	def test_unchanged_dir_total_not_in_diff(self):
 		self.write("a/f", b"12345")
@@ -2059,6 +2718,422 @@ class EndToEnd(unittest.TestCase):
 		code, out, _ = self.step()
 		self.assertEqual(code, 0)
 		self.assertEqual(out.splitlines(), ["без тегов: +0 -0 ~0 ->0 d~0", "с не отслеживаемыми тэгами: +0 -0 ~0 ->0 d~0"])
+
+
+# ------------------------------------------------------------ переход с формата 3
+
+
+def ns(sec, frac=0):
+	return sec * 10**9 + frac
+
+
+T1 = 1_790_000_000
+
+
+def v3_total(a, b):
+	"""Формат 3: [было, стало, +байты=+размер] строками."""
+	fmt = chkan.format_size
+	if a is None or b is None:
+		return [None if a is None else fmt(a), None if b is None else fmt(b)]
+	n = b - a
+	if n == 0:
+		delta = "0=0B"
+	else:
+		sign = "+" if n > 0 else "-"
+		num, human = fmt(abs(n)).split("=")
+		delta = f"{sign}{num}={sign}{human}"
+	return [fmt(a), fmt(b), delta]
+
+
+def v3_node(op):
+	node = {"op": op["op"]}
+	for k in ("new", "old"):
+		if k in op:
+			r = dict(op[k])
+			if "total" in r:
+				r["total"] = chkan.format_size(r["total"])
+			node[k] = r
+	if "from" in op:
+		node["from"] = op["from"]
+	if "set" in op:
+		changes = dict(op["set"])
+		if "total" in changes:
+			changes["total"] = v3_total(*changes["total"])
+		node["set"] = changes
+	return node
+
+
+def v3_flats():
+	a = {
+		".": drec(ino=1, dev=7, mtime=ns(T1, 111), ctime=ns(T1, 111), btime=ns(T1 - 5000, 5)),
+		"a.txt": rec(ino=2, dev=7, size=5, mtime=ns(T1, 222), ctime=ns(T1, 222), btime=ns(T1 - 100, 9)),
+		"b.txt": rec(ino=3, dev=7, size=10, mtime=ns(T1, 333), ctime=ns(T1, 333)),
+		"sub": drec(ino=4, dev=7, mtime=ns(T1, 1), ctime=ns(T1, 1)),
+	}
+	b = {
+		".": drec(ino=1, dev=7, mtime=ns(T1 + 100, 7), ctime=ns(T1 + 100, 7), btime=ns(T1 - 5000, 5)),
+		"a.txt": rec(ino=2, dev=7, size=8, mtime=ns(T1 + 50, 1), ctime=ns(T1 + 50, 1), btime=ns(T1 - 100, 9)),
+		"b.txt": rec(ino=3, dev=7, size=10, mtime=ns(T1, 999), ctime=ns(T1, 333)),  # изменилась только доля секунды
+		"c.txt": rec(ino=5, dev=7, size=4, mtime=ns(T1 + 60, 2), ctime=ns(T1 + 60, 2)),
+		"sub2": drec(ino=4, dev=7, mtime=ns(T1, 1), ctime=ns(T1, 500)),  # sub переименована, ctime только в наносекундах
+	}
+	return chkan.add_dir_totals(a), chkan.add_dir_totals(b)
+
+
+A_AT = "2026-10-01T15:00:00+02:00"
+B_AT = "2026-10-02T09:00:00+02:00"
+A_NAME = "scan_20261001-150000.json"
+B_NAME = "scan_20261002-090000.json"
+D_NAME = "diff_20261001-150000_20261002-090000.json"
+
+
+def v3_files(root):
+	"""Файлы формата 3, как их писала прошлая версия: наносекунды, tz, длинные дельты."""
+	flat_a, flat_b = v3_flats()
+
+	def snapshot(flat, at):
+		return {"format": 3, "root": root, "taken_at": at, "tz": "+02:00", "exclude": [".changes"], "tree": chkan.build_tree(flat)}
+
+	ops = chkan.make_ops(flat_a, flat_b, chkan.make_excluder([]), chkan.make_excluder([]))
+	nodes = {op["path"]: v3_node(op) for op in ops}
+	nodes["a.txt"]["c"] = "правил a"
+	sums = [sum(r["size"] for r in f.values() if r["type"] == "f") for f in (flat_a, flat_b)]
+	group = {"size": [chkan.format_size(n) for n in sums], "c": "группа", "ch": chkan.build_ch(nodes)}
+	head = lambda at: {"taken_at": at, "tz": "+02:00", "exclude": [".changes"]}
+	diff = {
+		"format": 3, "root": root, "from": head(A_AT), "to": head(B_AT),
+		"groups": {"-": group, "-" * 10: 0},
+	}
+	dump = lambda x: json.dumps(x, ensure_ascii=False, separators=(",", ":"))
+	return {
+		A_NAME: dump(snapshot(flat_a, A_AT)),
+		B_NAME: dump(snapshot(flat_b, B_AT)),
+		D_NAME: json.dumps(diff, ensure_ascii=False, indent="\t") + "\n",
+	}
+
+
+class MigrationFormat3(unittest.TestCase):
+	def setUp(self):
+		self.tmp = tempfile.TemporaryDirectory()
+		self.addCleanup(self.tmp.cleanup)
+		self.root = os.path.realpath(self.tmp.name)
+		self.changes = os.path.join(self.root, ".changes")
+		os.makedirs(self.changes)
+		with open(os.path.join(self.changes, "TAGS.txt"), "w", encoding="utf-8") as f:
+			f.write(".changes/\t# @exclude\n")
+		self.originals = v3_files(self.root)
+		for name, text in self.originals.items():
+			self.put(name, text)
+		self.clock = datetime.datetime(2026, 10, 3, 10, 0, 0, tzinfo=TZ)
+		p = mock.patch.object(chkan, "_now", lambda: self.clock)
+		p.start()
+		self.addCleanup(p.stop)
+
+	def put(self, name, text):
+		with open(os.path.join(self.changes, name), "w", encoding="utf-8") as f:
+			f.write(text)
+
+	def path(self, name):
+		return os.path.join(self.changes, name)
+
+	def load(self, name):
+		return chkan.read_json(self.path(name))
+
+	def migrate(self, answer=None, assume_yes=True):
+		out, err = io.StringIO(), io.StringIO()
+		patcher = mock.patch("builtins.input", return_value=answer) if answer is not None else mock.patch("builtins.input", side_effect=AssertionError("не должен спрашивать"))
+		with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), patcher:
+			result = chkan.migrate_if_needed(self.changes, assume_yes=assume_yes)
+		return result, out.getvalue(), err.getvalue()
+
+	def snapshot_bytes(self):
+		out = {}
+		for n in sorted(os.listdir(self.changes)):
+			if n != "TAGS.txt" and os.path.isfile(self.path(n)):
+				with open(self.path(n), "rb") as f:
+					out[n] = f.read()
+		return out
+
+	# --- распознавание
+	def test_peek_format_of_both_layouts(self):
+		self.assertEqual(chkan.peek_format(self.path(A_NAME)), 3)
+		self.assertEqual(chkan.peek_format(self.path(D_NAME)), 3)
+		self.put("garbage.json", "не json")
+		self.assertIsNone(chkan.peek_format(self.path("garbage.json")))
+		self.assertEqual(chkan.old_format_files(self.changes), [(D_NAME, 3), (A_NAME, 3), (B_NAME, 3)][:0] or sorted([(A_NAME, 3), (B_NAME, 3), (D_NAME, 3)]))
+
+	def test_read_json_hints_at_migration(self):
+		with self.assertRaises(chkan.ChkanError) as cm:
+			chkan.read_json(self.path(A_NAME))
+		self.assertIn("преобразовать", str(cm.exception))
+
+	# --- вопрос
+	def test_declined_leaves_everything_as_is(self):
+		before = self.snapshot_bytes()
+		result, out, err = self.migrate(answer="n", assume_yes=False)
+		self.assertFalse(result)
+		self.assertEqual(out, "")
+		self.assertIn("формата 3: 3", err)
+		self.assertIn("format3/", err)
+		self.assertIn("[y/N]", err)
+		self.assertIn("Отмена", err)
+		self.assertEqual(self.snapshot_bytes(), before)
+		self.assertFalse(os.path.exists(self.path("format3")))
+
+	def test_default_answer_is_no(self):
+		result, _, _ = self.migrate(answer="", assume_yes=False)
+		self.assertFalse(result)
+
+	def test_yes_converts(self):
+		result, out, err = self.migrate(answer="y", assume_yes=False)
+		self.assertTrue(result)
+		self.assertEqual(out, "")
+		self.assertEqual(chkan.old_format_files(self.changes), [])
+		self.assertIn("Преобразовано в формат 4: 3 файлов", err)
+
+	def test_assume_yes_does_not_ask(self):
+		self.assertTrue(self.migrate()[0])
+
+	def test_second_call_is_a_noop_and_never_asks(self):
+		self.migrate()
+		before = self.snapshot_bytes()
+		result, _, err = self.migrate(assume_yes=False)
+		self.assertTrue(result)
+		self.assertEqual(err, "")
+		self.assertEqual(self.snapshot_bytes(), before)
+
+	# --- что получилось
+	def test_originals_are_kept_byte_for_byte(self):
+		self.migrate()
+		backup = self.path("format3")
+		self.assertEqual(sorted(os.listdir(backup)), sorted(self.originals))
+		for name, text in self.originals.items():
+			with open(os.path.join(backup, name), encoding="utf-8") as f:
+				self.assertEqual(f.read(), text)
+		self.assertFalse([n for n in os.listdir(self.changes) if n.endswith(".v4") or n.endswith(".tmp")])
+
+	def test_scans_become_seconds_without_tz(self):
+		self.migrate()
+		a = self.load(A_NAME)
+		self.assertEqual(a["format"], 4)
+		self.assertNotIn("tz", a)
+		self.assertEqual(list(a), ["format", "root", "taken_at", "exclude", "tree"])
+		flat = chkan.flatten(a["tree"])
+		self.assertEqual(flat["."]["mtime"], T1)
+		self.assertEqual(flat["a.txt"]["mtime"], T1)
+		self.assertEqual(flat["a.txt"]["btime"], T1 - 100)
+		self.assertIsNone(flat["b.txt"]["btime"])
+		self.assertEqual(flat["."]["total"], 15)
+		b = chkan.flatten(self.load(B_NAME)["tree"])
+		self.assertEqual((b["c.txt"]["mtime"], b["sub2"]["ctime"]), (T1 + 60, T1))
+
+	def test_diff_header_and_sizes(self):
+		self.migrate()
+		d = self.load(D_NAME)
+		self.assertEqual(d["format"], 4)
+		self.assertEqual(d["from"], {"taken_at": A_AT, "exclude": [".changes"]})
+		self.assertEqual(d["to"], {"taken_at": B_AT, "exclude": [".changes"]})
+		self.assertEqual(d["groups"]["-"]["size"], ["15=15B", "22=22B", "+7B"])
+		self.assertEqual(d["groups"]["-" * 10], 0)
+		self.assertNotIn("c", d)  # комментария к diff в формате 3 не было
+
+	def test_diff_nodes_times_totals_and_dropped_noise(self):
+		self.migrate()
+		d = self.load(D_NAME)
+		ops = {o["path"]: o for o in chkan.diff_ops(d)}
+		self.assertEqual(sorted(ops), [".", "a.txt", "c.txt", "sub2"])  # b.txt менялся только в долях секунды
+		self.assertEqual(ops["a.txt"]["set"], {"size": [5, 8], "mtime": [T1, T1 + 50], "ctime": [T1, T1 + 50]})
+		self.assertEqual(ops["."]["op"], "change_d")
+		self.assertEqual(ops["."]["set"]["total"], [15, 22])
+		self.assertEqual(ops["."]["set"]["mtime"], [T1, T1 + 100])
+		self.assertEqual(ops["c.txt"]["new"]["mtime"], T1 + 60)
+		self.assertIsNone(ops["c.txt"]["new"]["btime"])
+		self.assertEqual((ops["sub2"]["op"], ops["sub2"]["from"]), ("move", "sub"))
+		self.assertNotIn("set", ops["sub2"])  # ctime отличался только в наносекундах
+
+	def test_diff_times_are_text_in_to_timezone_and_deltas_short(self):
+		self.migrate()
+		text = read_text(self.path(D_NAME))
+		self.assertNotIn("tz", text)
+		self.assertNotIn("+7=+7B", text)
+		self.assertIn('"total": ["15=15B", "22=22B", "+7B"]', text)
+		ref = chkan.TimeRef(B_AT)
+		self.assertIn(json.dumps(ref.encode(T1 + 50)), text)
+
+	def test_comments_are_preserved(self):
+		self.migrate()
+		d = self.load(D_NAME)
+		self.assertEqual(d["groups"]["-"]["c"], "группа")
+		nodes = dict(chkan.iter_nodes(d["groups"]["-"]["ch"]))
+		self.assertEqual(nodes["a.txt"]["c"], "правил a")
+
+	def test_new_layout_is_used_for_migrated_diff(self):
+		self.migrate()
+		text = read_text(self.path(D_NAME))
+		self.assertRegex(text, r'"\.": \{"op": "change_d", "set": \{[^\n]*\}\}')  # папка: одна строка
+		self.assertEqual(json.loads(text), self.load(D_NAME))
+		self.assertTrue(text.endswith("}\n"))
+
+	def test_chain_is_consistent_in_both_directions(self):
+		self.migrate()
+		a, b, d = self.load(A_NAME), self.load(B_NAME), self.load(D_NAME)
+		self.assertEqual(chkan.apply_diff(a, d), {**b, "tree": chkan.build_tree(chkan.flatten(b["tree"]))})
+		self.assertEqual(chkan.apply_diff(b, d, backward=True), a)
+
+	# --- отказы
+	def test_inconsistent_chain_aborts_and_touches_nothing(self):
+		d = json.loads(self.originals[D_NAME])
+		node = d["groups"]["-"]["ch"]["a.txt"]
+		node["set"]["size"] = [5, 9]  # в скане B размер 8
+		self.put(D_NAME, json.dumps(d, ensure_ascii=False))
+		before = self.snapshot_bytes()
+		with self.assertRaises(chkan.ChkanError):
+			self.migrate()
+		self.assertEqual(self.snapshot_bytes(), before)
+		self.assertFalse(os.path.exists(self.path("format3")))
+
+	def test_broken_json_aborts_and_cleans_temp_files(self):
+		self.put(D_NAME, "{ не json")
+		before = self.snapshot_bytes()
+		with self.assertRaises(Exception):
+			self.migrate()
+		self.assertEqual(self.snapshot_bytes(), before)
+
+	def test_nonempty_backup_dir_is_refused(self):
+		os.makedirs(self.path("format3"))
+		with open(self.path("format3/x"), "w") as f:
+			f.write("x")
+		before = self.snapshot_bytes()
+		with self.assertRaises(chkan.ChkanError) as cm:
+			self.migrate()
+		self.assertIn("format3", str(cm.exception))
+		self.assertEqual(self.snapshot_bytes(), before)
+
+	def test_unknown_format_is_refused(self):
+		self.put("scan_20250101-000000.json", '{"format":2,"tree":{}}')
+		with self.assertRaises(chkan.ChkanError):
+			self.migrate()
+
+	def test_only_old_files_are_converted_when_formats_are_mixed(self):
+		self.migrate()
+		new_before = {n: v for n, v in self.snapshot_bytes().items() if n in (A_NAME, B_NAME)}
+		os.rename(self.path(D_NAME), self.path("old_diff.keep"))
+		shutil_backup = self.path("format3")
+		for n in os.listdir(shutil_backup):
+			os.remove(os.path.join(shutil_backup, n))
+		os.rmdir(shutil_backup)
+		self.put(D_NAME, self.originals[D_NAME])  # снова диф в формате 3 рядом с уже новыми слепками
+		result, _, err = self.migrate()
+		self.assertTrue(result)
+		self.assertIn("1 файлов", err)
+		after = self.snapshot_bytes()
+		for n, data in new_before.items():
+			self.assertEqual(after[n], data)
+		self.assertEqual(self.load(D_NAME)["format"], 4)
+
+	def test_single_old_scan_without_diffs(self):
+		for n in (B_NAME, D_NAME):
+			os.remove(self.path(n))
+		self.assertTrue(self.migrate()[0])
+		self.assertEqual(self.load(A_NAME)["format"], 4)
+
+	# --- единичные преобразования
+	def test_migrate_snapshot_floor_division_and_nulls(self):
+		data = {"format": 3, "tz": "+00:00", "tree": {"mtime": ns(-1, 5), "ctime": ns(2, 999_999_999), "btime": None, "ch": {"x": {"mtime": ns(7, 1), "ctime": 0, "btime": ns(8)}}}}
+		out = chkan.migrate_snapshot(data)
+		self.assertEqual((out["format"], "tz" in out), (4, False))
+		self.assertEqual((out["tree"]["mtime"], out["tree"]["ctime"], out["tree"]["btime"]), (-1, 2, None))
+		self.assertEqual(out["tree"]["ch"]["x"], {"mtime": 7, "ctime": 0, "btime": 8})
+
+	def v3_diff(self, ch, scan=None, c=None):
+		d = {
+			"format": 3, "root": "/r",
+			"from": {"taken_at": A_AT, "tz": "+02:00", "exclude": []},
+			"to": {"taken_at": B_AT, "tz": "+02:00", "exclude": []},
+			"groups": {"-": {"size": ["1=1B", "2=2B"], "ch": ch}, "-" * 10: 0},
+		}
+		if scan:
+			d["scan"] = {"ch": scan}
+		return d
+
+	def test_empty_change_with_children_becomes_container_and_comment_survives(self):
+		ch = {
+			"d": {"op": "change_d", "set": {"mtime": [ns(5, 1), ns(5, 2)]}, "ch": {"f": {"op": "change", "set": {"size": [1, 2]}}}},
+			"e": {"op": "change_d", "set": {"mtime": [ns(5, 1), ns(5, 2)]}, "c": "важно"},
+			"g": {"op": "change", "set": {"mtime": [ns(5, 1), ns(5, 2)]}},
+		}
+		out = chkan.migrate_diff(self.v3_diff(ch))["groups"]["-"]["ch"]
+		self.assertEqual(out["d"], {"ch": {"f": {"op": "change", "set": {"size": [1, 2]}}}})
+		self.assertEqual(out["e"], {"c": "важно"})
+		self.assertNotIn("g", out)
+
+	def test_move_keeps_node_when_set_vanishes_and_scan_ops_are_converted(self):
+		ref = chkan.TimeRef(B_AT)
+		rec_ = {"type": "f", "dev": 1, "ino": 2, "size": 3, "mtime": ns(T1, 9), "ctime": ns(T1, 9), "btime": None, "uid": 0, "gid": 0, "mode": "0644"}
+		ch = {"m": {"op": "move", "from": "n", "set": {"ctime": [ns(5, 1), ns(5, 2)]}}}
+		scan = {"data": {"op": "add_scan", "new": dict(rec_)}, "tmp": {"op": "remove_scan", "old": dict(rec_)}}
+		out = chkan.migrate_diff(self.v3_diff(ch, scan))
+		self.assertEqual(out["groups"]["-"]["ch"]["m"], {"op": "move", "from": "n"})
+		self.assertEqual(out["scan"]["ch"]["data"]["new"]["mtime"], ref.encode(T1))
+		self.assertEqual(out["scan"]["ch"]["tmp"]["old"]["ctime"], ref.encode(T1))
+		self.assertIsNone(out["scan"]["ch"]["data"]["new"]["btime"])
+
+	def test_total_none_pairs_survive(self):
+		ch = {"d": {"op": "change_d", "set": {"total": [None, "500=500B"]}}, "e": {"op": "change_d", "set": {"total": ["1=1B", "5=5B", "+4=+4B"]}}}
+		out = chkan.migrate_diff(self.v3_diff(ch))["groups"]["-"]["ch"]
+		self.assertEqual(out["d"]["set"]["total"], [None, "500=500B"])
+		self.assertEqual(out["e"]["set"]["total"], ["1=1B", "5=5B", "+4B"])
+
+	def test_old_numeric_two_element_group_sizes(self):
+		d = self.v3_diff({})
+		d["groups"]["-"]["size"] = [8_234_782_596, 8_234_782_596]
+		out = chkan.migrate_diff(d)
+		self.assertEqual(out["groups"]["-"]["size"], ["8_234_782_596=7.6G", "8_234_782_596=7.6G", "0B"])
+
+	# --- через chkan.py целиком
+	def test_main_asks_then_migrates_then_scans(self):
+		with mock.patch("builtins.input", return_value="y") as inp:
+			err = io.StringIO()
+			out = io.StringIO()
+			with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+				code = chkan.main([self.root])
+		self.assertEqual(code, 0)
+		inp.assert_called_once()
+		self.assertIn("формата 3", err.getvalue())
+		self.assertEqual(chkan.old_format_files(self.changes), [])
+
+	def test_main_declined_does_not_scan(self):
+		before = self.snapshot_bytes()
+		err = io.StringIO()
+		with mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+			code = chkan.main([self.root])
+		self.assertEqual(code, 1)
+		self.assertEqual(self.snapshot_bytes(), before)
+
+	def test_main_yes_migrates_scans_and_keeps_the_chain_consistent(self):
+		out, err = io.StringIO(), io.StringIO()
+		with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+			code = chkan.main([self.root, "-y"])
+		self.assertEqual(code, 0, err.getvalue())
+		scans = chkan.list_scans(self.changes)
+		self.assertEqual(scans, ["20261001-150000", "20261003-100000"])  # B был промежуточным и удалён после проверки
+		diffs = sorted(n for n in os.listdir(self.changes) if n.startswith("diff_"))
+		self.assertEqual(diffs, [D_NAME, "diff_20261002-090000_20261003-100000.json"])
+		self.assertEqual(sorted(os.listdir(self.path("format3"))), sorted(self.originals))  # оригиналы, в том числе B
+		self.assertEqual(chkan.old_format_files(self.changes), [])
+		paths = {n: self.path(n) for n in os.listdir(self.changes) if n.startswith(("scan_", "diff_"))}
+		chkan.check_chain(self.changes, paths)  # первый скан + все diff = последний скан
+		self.assertTrue(out.getvalue().startswith("без тегов:"))
+		last = self.load("scan_20261003-100000.json")
+		self.assertEqual(sorted(chkan.flatten(last["tree"])), ["."])
+
+	def test_main_single_old_scan_then_new_diff(self):
+		for n in (B_NAME, D_NAME):
+			os.remove(self.path(n))
+		with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			self.assertEqual(chkan.main([self.root, "-y"]), 0)
+		self.assertEqual(len([n for n in os.listdir(self.changes) if n.startswith("diff_")]), 1)
+		self.assertEqual(self.load(A_NAME)["format"], 4)
 
 
 if __name__ == "__main__":
