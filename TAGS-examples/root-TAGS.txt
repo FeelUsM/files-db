@@ -1,0 +1,21 @@
+// root = папка, в которой лежит .changes/
+// Строка: путь<TAB># тег тег(ignore) // комментарий. Вложенность задаётся табами.
+// Зарезервировано: exclude (не сканировать), префикс no_ (снимает тег), and, or.
+// Пример:
+//   .cache/	# exclude
+//   projects/	# work
+//   	old/	# no_work
+// # noisy(ignore)	// строка без пути только помечает тег игнорируемым
+
+media # @exclude
+mnt # @exclude
+home/feelus # @exclude @run(sudo -u feelus chkan.py)
+root # @exclude @run(chkan.py)
+
+proc # @exclude
+sys # sys // @exclude // настройки устройств
+dev # dev // @exclude // файлы обмена данными с устройствами
+run # @exclude // cache
+
+# @run(proch.py)
+// # @run(subl $CHKAN_TAGS $CHKAN_DIFF)

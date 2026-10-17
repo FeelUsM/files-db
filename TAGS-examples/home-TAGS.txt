@@ -1,0 +1,437 @@
+// root = папка, в которой лежит .changes/
+// Строка: путь<TAB># тег тег(ignore) @no(тег) @exclude @run(команда) // комментарий
+// Вложенность задаётся табами. Спец-теги начинаются с @:
+//   @exclude    не сканировать
+//   @no(тег)    снять тег с этого пути и всего поддерева
+//   @run(bash)  выполнить в конце; текущая папка = путь строки (без пути: root);
+//               в окружении CHKAN_TAGS, CHKAN_DIFF, CHKAN_SCAN. @run пишите последним в строке.
+// Пример:
+//   .cache/	# @exclude
+//   projects/	# work
+//   	old/	# @no(work)
+//   # noisy(ignore)	// строка без пути только помечает тег игнорируемым
+//   # @run(echo $CHKAN_DIFF)
+
+.cache/
+.config/
+.local/share/
+.local/state/
+
+# log(ignore) // данные, которые нужны только для отладки
+# state(ignore) // данные, которы меняются в ходе нормальной работы, без инициативного участия человека
+# cache(ignore) // state, который можно удалить и ничего не сломается
+# settings // данные, которые инициативно меняются человеком, но не представляют ценности вне этого приложения
+# user_data // представляют ценность вне этого приложения
+
+# @run(subl $CHKAN_TAGS $CHKAN_DIFF)
+
+
+// -----------------------------------------
+// --- user_data  ---
+
+tmp # user_data
+Загрузки # user_data
+.ssh # user_data
+Документы # user_data
+Изображения # user_data
+
+// -----------------------------------------
+// --- utils ---
+
+.cache/sublime-text # sublime // ... файл с сессией
+.config/sublime-text # sublime // ... папка с плагинами
+.local/share/
+.local/state/
+
+.bash_history # bash
+.bashrc # bash
+
+.selected_editor # editor
+.local/share/nano # editor
+.nanorc # editor
+
+.sqlite_history # sqlite
+
+.gitconfig # git
+
+.cache/
+	gitstatus # p10k // сторонняя утилита, которая ускоряет отображение статуса Git в приглашении командной строки
+	p10k-dump-feelus.zsh # p10k
+	p10k-dump-feelus.zsh.zwc # p10k
+	p10k-feelus # p10k
+	p10k-instant-prompt-feelus.zsh # p10k
+	p10k-instant-prompt-feelus.zsh.zwc # p10k
+.p10k.zsh # p10k
+powerlevel10k # p10k
+
+.zcompdump # zsh
+.zshrc # zsh
+.oh-my-zsh # zsh
+.zcompdump-feelus-nvme-ubuntu-5.9 # zsh
+.zcompdump-feelus-nvme-ubuntu-5.9.zwc # zsh
+.zsh_history # zsh
+.zshrc.pre-oh-my-zsh # zsh
+
+.cache/uv # uv
+.config
+	fish # uv
+	uv # uv
+.local/bin/
+	env # uv
+	env.fish # uv
+	uv # uv
+	uvx # uv
+
+.python_history # python
+
+// -----------------------------------------
+// --- container ---
+
+container/py14 # python
+
+.cache/
+	short-name-aliases.conf.lock # podman
+	containers/short-name-aliases.conf # podman
+.local/share/containers # @exclude @run(sudo -u root chkan.py)
+.config/containers/registries.conf # podman
+// -----------------------------------------
+// --- separate programs ---
+
+.cache/
+.config/btop # btop
+.local/share/
+.local/state/btop.log # btop
+
+.config/obsidian # obsidian
+
+.cache/keepassxc # keepassxc
+.config/
+	keepassxc # keepassxc
+	KeePassXCrc # keepassxc
+.local/share/
+.local/state/
+
+.cache/Happ # Happ
+.config/
+	Happ # Happ
+	Happ.conf # Happ
+.config/autostart/Happ.desktop # Happ
+.local/share/Happ # Happ
+.local/state/
+
+.cache/
+.config/
+	autostart/koala-clash.desktop # koala_clash
+	koala-clash # koala_clash
+.local/share/
+.local/state/
+
+.cache/
+.config/
+	Prizrak-Box # Prizrak_Box
+	autostart/Prizrak-Box.desktop # Prizrak_Box
+.local/share/
+.local/state/
+Prizrak-Box-V3 # Prizrak_Box
+
+.cache/
+.config/Throne # Throne
+.local/share/
+	Throne # Throne
+	applications/throne-url-handler.desktop # Throne
+.local/state/
+
+.cache/zoom # zoom
+.config/
+	zoom # zoom
+	zoom.conf # zoom
+	zoomus.conf # zoom
+.local/share/
+.local/state/
+.zoom # zoom
+
+.config/
+	linux-punto-config.yaml # linux_punto_config
+	systemd/user/
+		default.target.wants/linux-punto-switcher.service # linux_punto_config
+		linux-punto-switcher.service # linux_punto_config
+
+.config/obs-studio # obs_studio
+.local/share/flatpak/db/screencast # obs_studio
+
+.local/share/applications/
+	steam.desktop # steam
+	DCS World Steam Edition.desktop # steam
+.steam # steam
+.steampath # steam
+.steampid # steam
+
+.cache/qBittorrent # qBittorrent
+.config/qBittorrent # qBittorrent
+.local/share/qBittorrent # qBittorrent
+.local/state/
+
+.cache/
+.config/
+	ktorrent_infowidgetrc # ktorrent
+	ktorrentrc # ktorrent
+.local/share/ktorrent # ktorrent
+.local/state/ktorrentstaterc # ktorrent
+
+.cache/
+.config/kolourpaintrc # paint
+.local/share/
+.local/state/kolourpaintstaterc # paint
+
+.cache/fastfetch # fastfetch
+
+// -----------------------------------------
+// --- snap programs ---
+
+snap # snap0
+	firefox # firefox
+
+// -----------------------------------------
+// --- flatpak programs ---
+
+.var/app # flatpak0
+.cache/
+	doc/by-app # flatpak0
+	flatpak # flatpak0
+.share/flatpak # flatpak0
+.local/share/flatpak # flatpak0
+
+.cache/gnome-software # flatpak0 // центр приложений
+.config/
+.local/share/gnome-software # flatpak0
+.local/state/gnome-software # flatpak0
+
+// -----------------------------------------
+// --- KDE programs ---
+
+.cache/
+.config/
+	kate # kate
+	kate-externaltoolspluginrc # kate
+	katerc # kate
+	katevirc # kate
+.local/share/
+	kate # kate
+	katestaterc # kate
+.local/state/
+	UserFeedback.org.kde.kate # kate
+	katestaterc # kate
+
+.cache/
+.config/
+	konsolerc # konsole
+	konsolesshconfig # konsole
+.local/share/konsole # konsole
+.local/state/konsolestaterc # konsole
+
+.cache/dolphin # dolphin
+.config/dolphinrc # dolphin
+.local/share/dolphin # dolphin
+.local/state/
+	UserFeedback.org.kde.dolphin # dolphin
+	dolphinstaterc # dolphin
+
+.cache/KDE/haruna # pleer_haruna
+.config/haruna # pleer_haruna
+.local/share/haruna # pleer_haruna
+.local/state/
+
+.cache/
+.config/partitionmanagerrc # KDE_partitionmanager
+.local/share/
+.local/state/partitionmanagerstaterc # KDE_partitionmanager
+
+.cache/discover # discover
+.config/
+.local/share/
+.local/state/
+	UserFeedback.org.kde.discover # discover
+	discoverstaterc # discover
+	discovernotifierstaterc # discover
+
+.cache/
+.config/
+	baloofileinformationrc # files0
+	ktrashrc # files0
+	trashrc # files0
+.local/share/
+	user-places.xbel # files0
+	user-places.xbel.bak # files0
+	user-places.xbel.tbcache # files0
+	RecentDocuments # files0
+	Trash # files0
+.local/state/
+
+.cache/
+	kscreenlocker_greet # kscreenlocker
+.config/
+	kscreenlockerrc # kscreenlocker
+.local/share/
+.local/state/
+
+.cache/
+	drkonqi # crash_reporter0
+	kcrash-metadata # crash_reporter0
+.config/drkonqirc # crash_reporter0
+.local/share/drkonqi # crash_reporter0
+.local/state/
+
+.config/kwalletrc # kdewallet
+
+.cache/
+.config/arkrc # KDE_unzip
+.local/share/ark # KDE_unzip
+.local/state/arkstaterc # KDE_unzip
+
+.cache/khelpcenter # KDE_help
+.config/khelpcenterrc # KDE_help
+.local/share/khelpcenter # KDE_help
+.local/state/khelpcenterstaterc # KDE_help
+
+.cache/
+.config/
+	okularpartrc # okular
+	okularrc # okular
+.local/share/okular # okular
+.local/state/okularstaterc # okular
+
+// -----------------------------------------
+// --- KDE ---
+
+.dbus // возможно из-за какого-то неправильного использования su или sudo
+
+.cache/dconf # GTK0
+.config/dconf # GTK0 // реестр настроек GTK приложений
+
+.cache
+	kwin # KDE0
+	plasma_theme_kubuntu.kcache # KDE0
+	qtshadercache-x86_64-little_endian-lp64 # KDE0
+	systemsettings # KDE0
+	appstream # KDE0
+	ksplash # KDE0
+	ksycoca6_ru_g+FY__LipGWZdibTsa4650yZk7Q= # KDE0
+	ksycoca6_ru_E7h5pLrynXV5irQ1fGK8rTGYMjA= # KDE0
+	ksycoca6_ru_40N5AUHMSt3031q+MiVMWKweNHQ= # KDE0
+	ksycoca5_ru_g+FY__LipGWZdibTsa4650yZk7Q= # KDE0 // System Configuration Cache - содержит информацию обо всех .desktop-файлах, MIME-типах
+	plasmashell # KDE0
+	update-manager-core # KDE0
+	thumbnails # KDE0
+	polkit-kde-authentication-agent-1 # KDE0
+	ksmserver-logout-greeter # KDE0
+	org.kde.unitconversion # KDE0
+	icon-cache.kcache # KDE0
+	krunner # KDE0 // строка запуска по alt+space
+	spectacle # KDE0 // скриншоты
+	xdg-desktop-portal-kde # KDE0
+.config
+	kdeglobals # KDE0
+	kglobalshortcutsrc # KDE0
+	kwinrc # KDE0
+	plasma-org.kde.plasma.desktop-appletsrc # KDE0
+	kwinoutputconfig.json # KDE0
+	xsettingsd # KDE0
+	kiorc # KDE0
+	kservicemenurc # KDE0
+	session # KDE0
+	kded5rc # KDE0
+	kded_device_automounterrc # KDE0
+	plasmashellrc # KDE0
+	KDE/UserFeedback.conf # KDE0
+	ksmserverrc # KDE0
+	plasmanotifyrc # KDE0
+	powerdevilrc # KDE0
+	mimeapps.list # KDE0 // поменял приложение для открытия .txt файлов с kate на sublime
+	kactivitymanagerd-statsrc # KDE0
+	kioslaverc # KDE0 // настройки сетевых операций: прокси, параметры работы с FTP, HTTP
+	spectaclerc # KDE0
+	plasmaparc # KDE0 // изменил максимальную громкость звука
+	plasma-workspace # KDE0
+	filetypesrc # KDE0
+.local/share
+	kactivitymanagerd # KDE0
+	kded6 # KDE0
+	sddm # KDE0
+	recently-used.xbel # KDE0
+	knewstuff3 # KDE0
+	krunnerstaterc # KDE0
+	libkunitconversion # KDE0
+	icons # KDE0
+.local/state
+	systemsettingsstaterc # KDE0
+	UserFeedback.org.kde.plasmashell # KDE0
+	kickerstaterc # KDE0
+	knighttimestaterc # KDE0
+	lesshst # KDE0
+	plasmashellstaterc # KDE0
+	xdg-desktop-portal-kdestaterc # KDE0
+	kiostaterc # KDE0
+
+// -----------------------------------------
+// --- devices ---
+
+.cache/
+	plasma-keyboard # keyboard0
+.config/
+	kcminputrc # keyboard0
+	kxkbrc # keyboard0
+	qtvirtualkeyboard # keyboard0
+	ibus # keyboard0
+	xkb # keyboard0
+.local/share/
+	klipper # keyboard0
+.local/state/
+
+.gtkrc-2.0 # graphics0
+.nv # graphics0 // проприетарный драйвер nvidia
+.cache/
+	gtk-4.0 # graphics0
+	ksvg-elements # graphics0
+	nvidia # graphics0
+	mesa_shader_cache # graphics0
+	glycin # graphics0 
+		// приложение Запускает отдельный процесс-загрузчик, 
+		// он читает файл изображения, декодирует его и передаёт результат основному приложению через разделяемую память (memfd).
+		// После этого процесс-загрузчик завершается
+	fontconfig # graphics0
+.config/
+	QtProject # graphics0
+	QtProject.conf # graphics0
+	Trolltech.conf # graphics0
+	gtk-3.0 # graphics0
+	gtk-4.0 # graphics0
+	gtkrc # graphics0
+	gtkrc-2.0 # graphics0
+.local/share/
+	kxmlgui5 # graphics0
+	fonts # graphics0
+	vulkan # graphics0
+.local/state/
+
+.cache/
+	event-sound-cache.tdb.deb782d8e46942968ef56f9f8096c599.x86_64-pc-linux-gnu.config # audio0
+	event-sound-cache.tdb.deb782d8e46942968ef56f9f8096c599.x86_64-pc-linux-gnu # audio0
+.local/share/
+.local/state/
+	wireplumber # audio0
+
+
+.cache/
+.config/
+	bluedevilglobalrc # bluetooth0
+.local/share/
+.local/state/
+
+// -----------------------------------------
+// --- libs ---
+
+.local/share/pki # certs // NSS Network Security Services - каталог базы данных сертификатов
+.pki # certs
+
+
+

@@ -20,12 +20,12 @@ EXAMPLE_TAGS = """\
 # logs(ignore)	// только помечает тег
 # docs	// ничего не значит
 
-.cache/	# exclude
+.cache/	# @exclude
 dir/	# tag
 	A/
-	B/	# no_tag
+	B/	# @no(tag)
 	C.txt
-	D.txt	# no_tag
+	D.txt	# @no(tag)
 var/	# logs
 media/	# tag photos
 """
@@ -116,13 +116,13 @@ class TagsParsing(unittest.TestCase):
 		self.assertEqual(set(rules.ignore_tags), {"t"})
 
 	def test_cancel_then_readd_deeper(self):
-		rules = chkan.parse_tags("a/\t# t\n\tb/\t# no_t\n\t\tc/\t# t\n")
+		rules = chkan.parse_tags("a/\t# t\n\tb/\t# @no(t)\n\t\tc/\t# t\n")
 		self.assertEqual(set(rules.tags_of("a/x")), {"t"})
 		self.assertEqual(set(rules.tags_of("a/b/x")), set())
 		self.assertEqual(set(rules.tags_of("a/b/c/x")), {"t"})
 
 	def test_left_to_right_inside_line(self):
-		rules = chkan.parse_tags("a/\t# t no_t u\n")
+		rules = chkan.parse_tags("a/\t# t @no(t) u\n")
 		self.assertEqual(set(rules.tags_of("a")), {"u"})
 
 	def test_multi_segment_paths_and_nesting(self):
@@ -147,7 +147,7 @@ class TagsParsing(unittest.TestCase):
 		self.assertEqual(set(rules.tags_of("Мои документы/x")), {"работа"})
 
 	def test_exclude_list_canonical(self):
-		rules = chkan.parse_tags("b/\t# exclude\na/\t# exclude\n\tinner/\t# exclude\n")
+		rules = chkan.parse_tags("b/\t# @exclude\na/\t# @exclude\n\tinner/\t# @exclude\n")
 		self.assertEqual(rules.exclude, ["a", "b"])
 
 	def test_exclude_state(self):
@@ -157,20 +157,26 @@ class TagsParsing(unittest.TestCase):
 
 	def test_errors(self):
 		bad = {
-			"no_exclude": "a/\t# no_exclude\n",
 			"spaces": "a/\t# t\n    b/\n",
 			"abs": "/etc/\t# t\n",
 			"dotdot": "../x\t# t\n",
 			"deep": "a/\n\t\tb/\n",
 			"token": "a/\t# t(foo)\n",
-			"and": "a/\t# and\n",
-			"or": "a/\t# or\n",
-			"no_prefix": "a/\t# no_no_x\n",
 			"bad_chars": "a/\t# t+u\n",
-			"ignore_exclude": "a/\t# exclude(ignore)\n",
-			"ignore_cancel": "a/\t# no_t(ignore)\n",
-			"root_exclude": "./\t# exclude\n",
-			"no_empty": "a/\t# no_\n",
+			"root_exclude": "./\t# @exclude\n",
+			"unknown_special": "a/\t# @bogus\n",
+			"special_with_ignore": "a/\t# @exclude(ignore)\n",
+			"no_empty": "a/\t# @no()\n",
+			"no_unclosed": "a/\t# @no(t\n",
+			"no_two_names": "a/\t# @no(a b)\n",
+			"no_bad_chars": "a/\t# @no(a+b)\n",
+			"no_of_special": "a/\t# @no(@exclude)\n",
+			"no_with_ignore": "a/\t# @no(t(ignore))\n",
+			"old_no_prefix_is_just_a_tag_but_at_alone_is_bad": "a/\t# @\n",
+			"run_unclosed": "a/\t# @run(echo hi\n",
+			"run_empty": "a/\t# @run()\n",
+			"run_blank": "a/\t# @run(   )\n",
+			"run_without_paren": "a/\t# @run\n",
 		}
 		for name, text in bad.items():
 			with self.subTest(name):
@@ -179,7 +185,7 @@ class TagsParsing(unittest.TestCase):
 
 	def test_error_mentions_line_number(self):
 		with self.assertRaises(chkan.ChkanError) as cm:
-			chkan.parse_tags("a/\t# t\nb/\t# no_exclude\n")
+			chkan.parse_tags("a/\t# t\nb/\t# @bogus\n")
 		self.assertIn(":2", str(cm.exception))
 
 
@@ -257,7 +263,7 @@ class StatAndScan(unittest.TestCase):
 		self.mk("a/skip/x.txt", b"2")
 		self.mk("top.txt", b"3")
 		self.mk(".changes/TAGS.txt", b"")
-		rules = chkan.parse_tags("a/skip/\t# exclude\n")
+		rules = chkan.parse_tags("a/skip/\t# @exclude\n")
 		flat, warnings = chkan.scan_fs(self.root, rules)
 		self.assertEqual(sorted(flat), [".", "a", "a/b", "a/b/c.txt", "top.txt"])
 		self.assertEqual(flat["."]["type"], "d")
@@ -501,7 +507,7 @@ class DiffOps(unittest.TestCase):
 TAGS_FOR_DIFF = """\
 # logs(ignore)
 dir/	# tag
-	B/	# no_tag
+	B/	# @no(tag)
 media/	# tag photos
 var/	# logs
 """
@@ -557,7 +563,7 @@ class DiffGrouping(unittest.TestCase):
 		self.assertEqual(g["photos+tag"]["size"], ["0=0B", "50=50B"])
 
 	def test_cancelled_tag_files_count_as_untagged(self):
-		# dir/B/b.txt (40 байт) не менялся, но no_tag делает его «без тегов» и он входит в сумму
+		# dir/B/b.txt (40 байт) не менялся, но @no(tag) делает его «без тегов» и он входит в сумму
 		self.assertEqual(sizes(self.diff()["groups"]["-"]), [50, 90])
 
 	def test_move_goes_to_destination_group_with_path_compression(self):
@@ -1348,6 +1354,215 @@ class ProgressWithMessages(unittest.TestCase):
 			self.assertNotIn("bad1", flat)
 
 
+class SpecialTags(unittest.TestCase):
+	def test_old_reserved_names_are_ordinary_tags_now(self):
+		rules = chkan.parse_tags("a/\t# exclude no_x and or\n")
+		self.assertEqual(set(rules.tags_of("a/f")), {"exclude", "no_x", "and", "or"})
+		self.assertEqual(rules.exclude, [])
+		self.assertFalse(rules.state_of("a/f").excluded)
+
+	def test_exclude_special(self):
+		rules = chkan.parse_tags("a/\t# @exclude\nb/\t# t @exclude u\n")
+		self.assertEqual(rules.exclude, ["a", "b"])
+		self.assertTrue(rules.state_of("a/x/y").excluded)
+		self.assertEqual(set(rules.tags_of("b/f")), {"t", "u"})
+
+	def test_no_cancels_in_subtree(self):
+		rules = chkan.parse_tags("a/\t# t u\n\tb/\t# @no(t)\n")
+		self.assertEqual(set(rules.tags_of("a/x")), {"t", "u"})
+		self.assertEqual(set(rules.tags_of("a/b/x")), {"u"})
+
+	def test_no_for_tag_that_is_not_set_is_harmless(self):
+		self.assertEqual(set(chkan.parse_tags("a/\t# @no(zzz)\n").tags_of("a")), set())
+
+	def test_no_of_exclude_name_is_just_a_tag_name(self):
+		rules = chkan.parse_tags("a/\t# exclude\n\tb/\t# @no(exclude)\n")
+		self.assertEqual(set(rules.tags_of("a/f")), {"exclude"})
+		self.assertEqual(set(rules.tags_of("a/b/f")), set())
+
+	def test_exclude_cannot_be_cancelled(self):
+		rules = chkan.parse_tags("a/\t# @exclude\n\tb/\t# t\n")
+		self.assertTrue(rules.state_of("a/b/x").excluded)
+
+	def test_special_tags_inside_ignore_mark_rules(self):
+		rules = chkan.parse_tags("# t(ignore)\na/\t# @no(t) t(ignore)\n")
+		self.assertEqual(set(rules.ignore_tags), {"t"})
+		self.assertEqual(set(rules.tags_of("a")), {"t"})  # слева направо: сначала снять, потом поставить
+
+	def test_unicode_tags_in_no(self):
+		rules = chkan.parse_tags("a/\t# работа\n\tb/\t# @no(работа)\n")
+		self.assertEqual(set(rules.tags_of("a/b")), set())
+
+	def test_comment_needs_space_before_double_slash(self):
+		rules = chkan.parse_tags("a//b\t# t\nc/\t# u // комментарий (со скобкой)\n")
+		self.assertEqual(set(rules.tags_of("a/b")), {"t"})  # // внутри пути не комментарий
+		self.assertEqual(set(rules.tags_of("c")), {"u"})
+
+	def test_comment_may_follow_special_tags(self):
+		rules = chkan.parse_tags("a/\t# @exclude // потому что кэш\n")
+		self.assertEqual(rules.exclude, ["a"])
+
+
+class RunParsing(unittest.TestCase):
+	def runs(self, text):
+		return chkan.parse_tags(text).runs
+
+	def test_path_line_and_pathless_line(self):
+		self.assertEqual(
+			self.runs("папка111\t# @run(echo a)\n# @run(echo b)\n"),
+			[("папка111", "echo a"), (".", "echo b")],
+		)
+
+	def test_order_of_file_and_nesting_paths(self):
+		text = "a/\t# @run(one)\n\tb/\t# @run(two)\n# @run(three)\nc/d/\t# @run(four)\n"
+		self.assertEqual(self.runs(text), [("a", "one"), ("a/b", "two"), (".", "three"), ("c/d", "four")])
+
+	def test_dot_and_empty_path_mean_root(self):
+		self.assertEqual(self.runs("./\t# @run(x)\n"), [(".", "x")])
+
+	def test_goes_to_last_paren_in_line(self):
+		self.assertEqual(self.runs("a/\t# @run(echo $(date) | tee (x))\n"), [("a", "echo $(date) | tee (x)")])
+
+	def test_two_commands_split_on_paren_run(self):
+		self.assertEqual(self.runs("a/\t# @run(first) @run(second)\n"), [("a", "first"), ("a", "second")])
+		self.assertEqual(self.runs("a/\t# @run(first)@run(second)\n"), [("a", "first"), ("a", "second")])
+		self.assertEqual(self.runs("a/\t# @run(x $(y))\t @run(z)\n"), [("a", "x $(y)"), ("a", "z")])
+
+	def test_three_commands_with_parens_inside(self):
+		self.assertEqual(
+			self.runs("# @run(a $(b)) @run(c (d) e) @run(f)\n"),
+			[(".", "a $(b)"), (".", "c (d) e"), (".", "f")],
+		)
+
+	def test_tags_before_run_are_applied(self):
+		rules = chkan.parse_tags("папка\t# @exclude t @run(sudo -u userxxx chkan.py)\n")
+		self.assertEqual(rules.exclude, ["папка"])
+		self.assertEqual(rules.runs, [("папка", "sudo -u userxxx chkan.py")])
+		rules2 = chkan.parse_tags("a/\t# t @run(cmd)\n")
+		self.assertEqual(set(rules2.tags_of("a")), {"t"})
+
+	def test_text_after_last_paren_is_parsed_as_tags(self):
+		rules = chkan.parse_tags("a/\t# @run(echo hi) @exclude\n")
+		self.assertEqual(rules.runs, [("a", "echo hi")])
+		self.assertEqual(rules.exclude, ["a"])
+
+	def test_run_must_be_last_after_it_everything_up_to_last_paren_is_command(self):
+		rules = chkan.parse_tags("a/\t# @run(echo hi) @no(t)\n")
+		self.assertEqual(rules.runs, [("a", "echo hi) @no(t")])
+
+	def test_comment_is_cut_before_parsing_so_parens_in_it_do_not_matter(self):
+		self.assertEqual(self.runs("a/\t# @run(echo hi) // потом (подробности)\n"), [("a", "echo hi")])
+
+	def test_url_inside_command_is_not_a_comment(self):
+		self.assertEqual(self.runs("# @run(curl https://example.com/x)\n"), [(".", "curl https://example.com/x")])
+
+	def test_hash_and_quotes_inside_command(self):
+		self.assertEqual(self.runs('a/\t# @run(echo "a #b" \'c)\')\n'), [("a", "echo \"a #b\" 'c)'")])
+
+	def test_command_whitespace_trimmed(self):
+		self.assertEqual(self.runs("# @run(   ls -la   )\n"), [(".", "ls -la")])
+
+	def test_pathless_line_ignores_other_specials(self):
+		rules = chkan.parse_tags("# @exclude @no(x) t @run(echo)\n")
+		self.assertEqual((rules.exclude, rules.runs), ([], [(".", "echo")]))
+
+	def test_run_does_not_change_tags_or_exclusions(self):
+		rules = chkan.parse_tags("a/\t# @run(x)\n")
+		self.assertEqual(set(rules.tags_of("a")), set())
+		self.assertEqual(rules.exclude, [])
+
+	def test_repeated_path_collects_commands_in_file_order(self):
+		self.assertEqual(self.runs("a/\t# @run(1)\nb/\t# @run(2)\na/\t# @run(3)\n"), [("a", "1"), ("b", "2"), ("a", "3")])
+
+	def test_template_parses_and_has_one_run_example(self):
+		rules = chkan.parse_tags(chkan.TAGS_TEMPLATE)
+		self.assertEqual(rules.runs, [])  # всё в комментариях
+
+
+class RunHooks(unittest.TestCase):
+	def setUp(self):
+		self.tmp = tempfile.TemporaryDirectory()
+		self.addCleanup(self.tmp.cleanup)
+		self.root = os.path.realpath(self.tmp.name)
+		os.makedirs(os.path.join(self.root, "sub dir"))
+
+	def go(self, runs, env=None):
+		out, err = io.StringIO(), io.StringIO()
+		with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+			failures = chkan.run_hooks(self.root, runs, env or {})
+		return failures, out.getvalue(), err.getvalue()
+
+	def read(self, rel):
+		with open(os.path.join(self.root, rel), encoding="utf-8") as f:
+			return f.read()
+
+	def test_prints_line_before_each_command(self):
+		failures, out, _ = self.go([("sub dir", "true"), (".", "true")])
+		self.assertEqual(failures, 0)
+		self.assertEqual(out.splitlines(), ["sub dir # @run(true)", ". # @run(true)"])
+
+	def test_cwd_is_path_of_line_or_root(self):
+		self.go([("sub dir", "pwd > ../a.txt"), (".", "pwd > b.txt")])
+		self.assertEqual(self.read("a.txt").strip(), os.path.join(self.root, "sub dir"))
+		self.assertEqual(self.read("b.txt").strip(), self.root)
+
+	def test_env_vars(self):
+		env = {"CHKAN_TAGS": "/t/TAGS.txt", "CHKAN_DIFF": "/t/diff.json", "CHKAN_SCAN": "/t/scan.json"}
+		self.go([(".", 'echo "$CHKAN_TAGS|$CHKAN_DIFF|$CHKAN_SCAN" > env.txt')], env)
+		self.assertEqual(self.read("env.txt").strip(), "/t/TAGS.txt|/t/diff.json|/t/scan.json")
+
+	def test_inherits_environment(self):
+		with mock.patch.dict(os.environ, {"MY_VAR": "42"}):
+			self.go([(".", 'echo "$MY_VAR" > v.txt')])
+		self.assertEqual(self.read("v.txt").strip(), "42")
+
+	def test_commands_run_sequentially_in_order(self):
+		self.go([(".", "echo 1 >> log.txt; sleep 0.2"), (".", "echo 2 >> log.txt"), (".", "echo 3 >> log.txt")])
+		self.assertEqual(self.read("log.txt").split(), ["1", "2", "3"])
+
+	def test_bash_features(self):
+		self.go([(".", "x=(a b c); echo ${x[1]} > bash.txt; [[ 1 -eq 1 ]] && echo ok >> bash.txt")])
+		self.assertEqual(self.read("bash.txt").split(), ["b", "ok"])
+
+	def test_failure_is_reported_and_next_commands_still_run(self):
+		failures, out, err = self.go([(".", "exit 7"), (".", "echo next > next.txt")])
+		self.assertEqual(failures, 1)
+		self.assertIn("кодом 7", err)
+		self.assertEqual(self.read("next.txt").strip(), "next")
+		self.assertEqual(len(out.splitlines()), 2)
+
+	def test_missing_dir_skips_command_and_counts_failure(self):
+		failures, _, err = self.go([("nope", "echo x > x.txt"), (".", "echo y > y.txt")])
+		self.assertEqual(failures, 1)
+		self.assertIn("нет папки nope", err)
+		self.assertFalse(os.path.exists(os.path.join(self.root, "x.txt")))
+		self.assertTrue(os.path.exists(os.path.join(self.root, "y.txt")))
+
+	def test_file_instead_of_dir_is_failure(self):
+		with open(os.path.join(self.root, "f"), "w") as f:
+			f.write("x")
+		failures, _, err = self.go([("f", "true")])
+		self.assertEqual(failures, 1)
+
+	def test_no_bash_is_reported(self):
+		with mock.patch.object(chkan.subprocess, "run", side_effect=FileNotFoundError("bash")):
+			failures, _, err = self.go([(".", "true")])
+		self.assertEqual(failures, 1)
+		self.assertIn("bash", err)
+
+	def test_uses_bash_dash_c(self):
+		with mock.patch.object(chkan.subprocess, "run") as run:
+			run.return_value.returncode = 0
+			self.go([("sub dir", "echo hi")], {"A": "1"})
+		args, kwargs = run.call_args
+		self.assertEqual(args[0], ["bash", "-c", "echo hi"])
+		self.assertEqual(kwargs["cwd"], os.path.join(self.root, "sub dir"))
+		self.assertEqual(kwargs["env"]["A"], "1")
+
+	def test_no_commands_prints_nothing(self):
+		self.assertEqual(self.go([]), (0, "", ""))
+
+
 # ------------------------------------------------------------ chkan.py целиком
 
 
@@ -1473,6 +1688,103 @@ class EndToEnd(unittest.TestCase):
 		self.assertTrue(all(l.startswith("Предупреждение: не прочитано bad") for l in lines[:10]))
 		self.assertEqual(lines[10], "... и ещё 2")
 
+	def hook_file(self, name):
+		with open(os.path.join(self.root, name), encoding="utf-8") as f:
+			return f.read()
+
+	def test_run_hooks_at_the_very_end_with_env_and_echo(self):
+		os.makedirs(os.path.join(self.root, "папка"))
+		self.tags(
+			"папка\t# @run(echo \"$PWD\" > ../cwd1.txt; echo $CHKAN_DIFF > ../diff1.txt)\n"
+			"# @run(echo $CHKAN_TAGS $CHKAN_SCAN > env2.txt) // комментарий\n"
+		)
+		self.write("a.txt", b"1")
+		self.assertEqual(self.step()[0], 0)
+		self.write("b.txt", b"2")
+		code, out, err = self.step()
+		self.assertEqual(code, 0)
+		lines = out.splitlines()
+		self.assertEqual(lines[-2:], ["папка # @run(echo \"$PWD\" > ../cwd1.txt; echo $CHKAN_DIFF > ../diff1.txt)", ". # @run(echo $CHKAN_TAGS $CHKAN_SCAN > env2.txt)"])
+		self.assertTrue(lines[0].startswith("без тегов:"))  # счётчики раньше команд
+		self.assertEqual(self.hook_file("cwd1.txt").strip(), os.path.join(self.root, "папка"))
+		self.assertEqual(self.hook_file("diff1.txt").strip(), os.path.join(self.changes, self.diffs()[-1]))
+		tags_path, scan_path = self.hook_file("env2.txt").split()
+		self.assertEqual(tags_path, os.path.join(self.changes, "TAGS.txt"))
+		self.assertEqual(scan_path, os.path.join(self.changes, self.scans()[-1]))
+		self.assertTrue(os.path.isabs(tags_path) and os.path.isabs(scan_path))
+
+	def test_hooks_see_files_after_cleanup_of_previous_scan(self):
+		self.tags("# @run(ls .changes > listing.txt)\n")
+		for name in ("a", "b", "c"):
+			self.write(name, b"1")
+			self.assertEqual(self.step()[0], 0)
+		listing = self.hook_file("listing.txt").split()
+		self.assertEqual(len([n for n in listing if n.startswith("scan_")]), 2)  # к этому моменту лишний скан уже удалён
+		self.assertEqual(len([n for n in listing if n.startswith("diff_")]), 2)
+
+	def test_hooks_run_on_first_scan_with_empty_diff_var(self):
+		self.tags("# @run(echo \"[$CHKAN_DIFF]\" > first.txt; echo $CHKAN_SCAN >> first.txt)\n")
+		code, out, _ = self.step()
+		self.assertEqual(code, 0)
+		self.assertIn("первый скан", out.splitlines()[0])
+		first = self.hook_file("first.txt").split("\n")
+		self.assertEqual(first[0], "[]")
+		self.assertEqual(first[1], os.path.join(self.changes, self.scans()[0]))
+
+	def test_failed_hook_gives_exit_code_3_but_scan_is_saved(self):
+		self.tags("# @run(exit 5) @run(echo after > after.txt)\n")
+		self.write("a", b"1")
+		code, out, err = self.step()
+		self.assertEqual(code, 3)
+		self.assertIn("кодом 5", err)
+		self.assertEqual(self.hook_file("after.txt").strip(), "after")
+		self.assertEqual(len(self.scans()), 1)
+
+	def test_no_hooks_when_scan_cancelled_by_warnings(self):
+		self.tags("# @run(echo ran > ran.txt)\n")
+		self.write("bad1", b"1")
+		with self.fail_on_bad(), mock.patch("builtins.input", return_value="n"):
+			code, _, _ = self.step()
+		self.assertEqual(code, 1)
+		self.assertFalse(os.path.exists(os.path.join(self.root, "ran.txt")))
+
+	def test_no_hooks_when_verification_fails(self):
+		self.tags("# @run(echo ran >> ran.txt)\n")
+		self.write("a", b"1")
+		self.step()
+		self.write("b", b"1")
+		self.step()
+		os.remove(os.path.join(self.root, "ran.txt"))
+		self.write("c", b"1")
+		with mock.patch.object(chkan, "apply_ops", lambda flat, ops, strict=True, progress=None: flat):
+			code, _, _ = self.step()
+		self.assertEqual(code, 2)
+		self.assertFalse(os.path.exists(os.path.join(self.root, "ran.txt")))
+
+	def test_hooks_ignored_for_excluded_path_scan_but_cwd_is_real_folder(self):
+		os.makedirs(os.path.join(self.root, "inner"))
+		self.write("inner/f", b"1")
+		self.tags("inner/\t# @exclude @run(ls > ../inner_ls.txt)\n")
+		self.assertEqual(self.step()[0], 0)
+		self.assertEqual(self.hook_file("inner_ls.txt").split(), ["f"])
+		scan = chkan.read_json(os.path.join(self.changes, self.scans()[0]))
+		self.assertNotIn("inner/f", chkan.flatten(scan["tree"]))
+
+	def test_tags_with_special_syntax_end_to_end(self):
+		self.tags("data/\t# tracked\n\tsecret/\t# @no(tracked)\n.cache/\t# @exclude\n")
+		self.write("data/a", b"1")
+		self.write("data/secret/s", b"1")
+		self.write(".cache/c", b"1")
+		self.step()
+		self.write("data/a", b"22")
+		self.write("data/secret/s", b"22")
+		code, out, _ = self.step()
+		self.assertEqual(code, 0)
+		lines = out.splitlines()
+		self.assertTrue(lines[0].startswith("без тегов: +0 -0 ~1"))  # data/secret/s без тега
+		self.assertTrue(lines[1].startswith("tracked: +0 -0 ~1"))  # data/a
+
+
 	def test_asks_and_cancel(self):
 		with mock.patch("builtins.input", return_value="n"):
 			code, out, _ = self.run_chkan()
@@ -1502,10 +1814,10 @@ class EndToEnd(unittest.TestCase):
 		self.assertIn("TAGS.txt", err)
 
 	def test_bad_tags_file_is_error(self):
-		self.tags("a/\t# no_exclude\n")
+		self.tags("a/\t# @bogus\n")
 		code, _, err = self.run_chkan()
 		self.assertEqual(code, 2)
-		self.assertIn("no_exclude", err)
+		self.assertIn("@bogus", err)
 		self.assertEqual(self.scans(), [])
 
 	def test_console_counters(self):
@@ -1532,7 +1844,7 @@ class EndToEnd(unittest.TestCase):
 		)
 
 	def test_scan_retention_and_reconstruction(self):
-		self.tags("data/\t# tracked\n.cache/\t# exclude\n")
+		self.tags("data/\t# tracked\n.cache/\t# @exclude\n")
 		self.write("data/a.txt", b"1")
 		self.write("data/old.txt", b"old")
 		self.write("loose.txt", b"1")
@@ -1574,9 +1886,9 @@ class EndToEnd(unittest.TestCase):
 	def test_exclude_changes_between_runs(self):
 		self.write("a/x", b"1")
 		self.write("b/y", b"22")
-		self.tags("a/\t# exclude\n")
+		self.tags("a/\t# @exclude\n")
 		self.assertEqual(self.step()[0], 0)
-		self.tags("b/\t# exclude\n")
+		self.tags("b/\t# @exclude\n")
 		self.assertEqual(self.step()[0], 0)
 		d = chkan.read_json(os.path.join(self.changes, self.diffs()[0]))
 		scan_ops = sorted((o["op"], o["path"]) for o in chkan.diff_ops(d) if o["op"].endswith("_scan"))

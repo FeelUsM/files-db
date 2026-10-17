@@ -7,7 +7,7 @@
 
 root = папка, в которой лежит .changes/TAGS.txt (по умолчанию текущая).
 Файлы в .changes/:
-	TAGS.txt                           теги и исключения
+	TAGS.txt                           теги, исключения и команды @run
 	scan_YYYYMMDD-HHMMSS.json          слепки (остаются первый и последний)
 	diff_<от>_<до>.json                diff-ы между соседними слепками
 """
@@ -20,6 +20,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 from collections import namedtuple
@@ -39,19 +40,28 @@ CHANGE_OPS = ("change", "change_d")  # change_d: то же, что change, но 
 INHERITED = ("dev", "uid", "gid")
 
 TAG_RE = re.compile(r"^[\w.]+$")
-TOKEN_RE = re.compile(r"^(?P<name>[^()\s]+)(?P<ignore>\(ignore\))?$")
+TAG_TOKEN_RE = re.compile(r"^(?P<name>[\w.]+)(?P<ignore>\(ignore\))?$")
+NO_RE = re.compile(r"^@no\((?P<name>[^()\s]*)\)$")
 HASH_RE = re.compile(r"(^|\s)#")
+COMMENT_RE = re.compile(r"(^|\s)//")  # комментарий: // в начале строки или после пробела (http://... не трогаем)
+RUN_START = "@run("
+RUN_NEXT_RE = re.compile(r"\)[ \t]*@run\(")
 SCAN_RE = re.compile(r"^scan_(\d{8}-\d{6})\.json$")
 
 TAGS_TEMPLATE = """\
 // root = папка, в которой лежит .changes/
-// Строка: путь<TAB># тег тег(ignore) // комментарий. Вложенность задаётся табами.
-// Зарезервировано: exclude (не сканировать), префикс no_ (снимает тег), and, or.
+// Строка: путь<TAB># тег тег(ignore) @no(тег) @exclude @run(команда) // комментарий
+// Вложенность задаётся табами. Спец-теги начинаются с @:
+//   @exclude    не сканировать
+//   @no(тег)    снять тег с этого пути и всего поддерева
+//   @run(bash)  выполнить в конце; текущая папка = путь строки (без пути: root);
+//               в окружении CHKAN_TAGS, CHKAN_DIFF, CHKAN_SCAN. @run пишите последним в строке.
 // Пример:
-//   .cache/	# exclude
+//   .cache/	# @exclude
 //   projects/	# work
-//   	old/	# no_work
-// # noisy(ignore)	// строка без пути только помечает тег игнорируемым
+//   	old/	# @no(work)
+//   # noisy(ignore)	// строка без пути только помечает тег игнорируемым
+//   # @run(echo $CHKAN_DIFF)
 """
 
 
@@ -150,10 +160,11 @@ class Resolver:
 
 
 class Rules:
-	def __init__(self, trie, ignore_tags, exclude):
+	def __init__(self, trie, ignore_tags, exclude, runs=()):
 		self.trie = trie
 		self.ignore_tags = frozenset(ignore_tags)
 		self.exclude = list(exclude)
+		self.runs = list(runs)  # [(путь относительно root или '.', команда)] в порядке файла
 
 	def root_state(self):
 		tags, excluded = _apply_ops(self.trie, frozenset(), False)
@@ -181,34 +192,69 @@ class Rules:
 
 
 def parse_tag_token(token, where):
-	m = TOKEN_RE.match(token)
+	"""Один тег без пробелов -> (вид, значение, ignore): add / cancel / exclude."""
+	if token == "@exclude":
+		return "exclude", None, False
+	if token.startswith("@no("):
+		m = NO_RE.match(token)
+		if not m:
+			raise ChkanError(f"{where}: неверный {token!r}, ожидалось @no(тег)")
+		name = m.group("name")
+		if name.startswith("@"):
+			raise ChkanError(f"{where}: спец-теги отменять нельзя: {token!r}")
+		if not TAG_RE.match(name):
+			raise ChkanError(f"{where}: недопустимое имя тега в {token!r} (буквы, цифры, _ и .)")
+		return "cancel", name, False
+	if token.startswith("@"):
+		raise ChkanError(f"{where}: неизвестный спец-тег {token!r}")
+	m = TAG_TOKEN_RE.match(token)
 	if not m:
-		raise ChkanError(f"{where}: непонятный тег {token!r}")
-	name = m.group("name")
-	ignore = bool(m.group("ignore"))
-	if name == "no_exclude":
-		raise ChkanError(f"{where}: тег no_exclude запрещён (exclude ничем не снимается)")
-	cancel = name.startswith("no_")
-	base = name[3:] if cancel else name
-	if not base or not TAG_RE.match(base):
-		raise ChkanError(f"{where}: недопустимое имя тега {token!r} (буквы, цифры, _ и .)")
-	if base.startswith("no_"):
-		raise ChkanError(f"{where}: имя тега не может начинаться с no_: {token!r}")
-	if base in ("and", "or"):
-		raise ChkanError(f"{where}: тег {base!r} зарезервирован")
-	if ignore and (cancel or base == "exclude"):
-		raise ChkanError(f"{where}: (ignore) нельзя ставить на {name!r}")
-	kind = "cancel" if cancel else ("exclude" if base == "exclude" else "add")
-	return kind, base, ignore
+		raise ChkanError(f"{where}: недопустимый тег {token!r} (буквы, цифры, _ и .; допустима пометка (ignore))")
+	return "add", m.group("name"), bool(m.group("ignore"))
+
+
+def parse_tag_items(text, where):
+	"""Часть строки после '#': теги, @exclude, @no(тег), @run(команда).
+
+	Команда @run идёт до первой `)  @run(` (следующая команда) или до последней `)` в строке."""
+	items = []
+	i, n = 0, len(text)
+	while i < n:
+		if text[i].isspace():
+			i += 1
+			continue
+		if text.startswith(RUN_START, i):
+			start = i + len(RUN_START)
+			m = RUN_NEXT_RE.search(text, start)
+			if m:
+				end, i = m.start(), m.end() - len(RUN_START)
+			else:
+				end = text.rfind(")", start)
+				if end < 0:
+					raise ChkanError(f"{where}: у @run нет закрывающей )")
+				i = end + 1
+			command = text[start:end].strip()
+			if not command:
+				raise ChkanError(f"{where}: пустая команда в @run")
+			items.append(("run", command, False))
+			continue
+		j = i
+		while j < n and not text[j].isspace():
+			j += 1
+		items.append(parse_tag_token(text[i:j], where))
+		i = j
+	return items
 
 
 def parse_tags(text):
 	trie = TagNode()
 	ignore_tags = set()
 	exclude = []
+	runs = []
 	stack = []
 	for lineno, raw in enumerate(text.splitlines(), 1):
-		line = raw.split("//", 1)[0].rstrip()
+		cm = COMMENT_RE.search(raw)
+		line = (raw[: cm.start()] if cm else raw).rstrip()
 		if not line.strip():
 			continue
 		where = f"{TAGS_FILE}:{lineno}"
@@ -221,15 +267,16 @@ def parse_tags(text):
 			path_part, tags_part = body[: m.start()].strip(), body[m.end():]
 		else:
 			path_part, tags_part = body.strip(), ""
-		parsed = [parse_tag_token(t, where) for t in tags_part.split()]
-		for _kind, base, ignore in parsed:
+		parsed = parse_tag_items(tags_part, where)
+		for kind, value, ignore in parsed:
 			if ignore:
-				ignore_tags.add(base)
+				ignore_tags.add(value)
 		if not path_part:
+			runs.extend((ROOT_KEY, value) for kind, value, _ in parsed if kind == "run")
 			continue
 		if path_part.startswith("/"):
 			raise ChkanError(f"{where}: пути задаются относительно root, без начального /")
-		segs = [s for s in path_part.split("/") if s not in ("", ".")]
+		segs = [seg for seg in path_part.split("/") if seg not in ("", ".")]
 		if ".." in segs:
 			raise ChkanError(f"{where}: .. в путях запрещено")
 		if indent > len(stack):
@@ -240,13 +287,16 @@ def parse_tags(text):
 		node = trie
 		for seg in full:
 			node = node.children.setdefault(seg, TagNode())
-		for kind, base, _ignore in parsed:
-			node.ops.append((kind, base))
+		for kind, value, _ignore in parsed:
+			if kind in ("add", "cancel", "exclude"):
+				node.ops.append((kind, value))
 			if kind == "exclude":
 				if not full:
 					raise ChkanError(f"{where}: нельзя исключить root")
 				exclude.append("/".join(full))
-	return Rules(trie, ignore_tags, canonical_exclude(exclude))
+			elif kind == "run":
+				runs.append(("/".join(full) or ROOT_KEY, value))
+	return Rules(trie, ignore_tags, canonical_exclude(exclude), runs)
 
 
 # ---------------------------------------------------------------- stat
@@ -1222,6 +1272,32 @@ def read_json(path):
 	return data
 
 
+# ---------------------------------------------------------------- @run
+
+
+def run_hooks(root, runs, env_extra):
+	"""Выполняет команды @run по очереди, каждую в bash -c; возвращает число неудач."""
+	failures = 0
+	for rel, command in runs:
+		print(f"{rel} # @run({command})")
+		sys.stdout.flush()
+		cwd = root if rel == ROOT_KEY else os.path.join(root, *rel.split("/"))
+		if not os.path.isdir(cwd):
+			print(f"Ошибка: нет папки {rel}, команда пропущена", file=sys.stderr)
+			failures += 1
+			continue
+		try:
+			code = subprocess.run(["bash", "-c", command], cwd=cwd, env={**os.environ, **env_extra}).returncode
+		except OSError as e:
+			print(f"Ошибка: не удалось запустить bash: {e}", file=sys.stderr)
+			failures += 1
+			continue
+		if code != 0:
+			print(f"Команда завершилась с кодом {code}", file=sys.stderr)
+			failures += 1
+	return failures
+
+
 # ---------------------------------------------------------------- время и файлы
 
 
@@ -1313,9 +1389,17 @@ def run(root, assume_yes=False, warn_yes=False):
 	with make_stage("слепок: запись", counted=False):
 		write_text_atomic(os.path.join(changes, scan_name(stamp)), dumps_snapshot(snapshot))
 
+	def finish(diff_path):
+		env = {
+			"CHKAN_TAGS": os.path.abspath(tags_path),
+			"CHKAN_DIFF": os.path.abspath(diff_path) if diff_path else "",
+			"CHKAN_SCAN": os.path.abspath(os.path.join(changes, scan_name(stamp))),
+		}
+		return 3 if run_hooks(root, rules.runs, env) else 0
+
 	if prev is None:
 		print(f"первый скан сохранён: {len(flat)} объектов ({scan_name(stamp)})")
-		return 0
+		return finish(None)
 
 	diff = build_diff_flat(snapshot_head(prev), prev_flat, snapshot_head(snapshot), flat, rules, root, stage=make_stage)
 	diff_path = os.path.join(changes, diff_name(scans[-1], stamp))
@@ -1338,7 +1422,7 @@ def run(root, assume_yes=False, warn_yes=False):
 
 	for line in format_summary(diff):
 		print(line)
-	return 0
+	return finish(diff_path)
 
 
 def main(argv=None):
